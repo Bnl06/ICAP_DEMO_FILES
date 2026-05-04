@@ -1,0 +1,21 @@
+[Unit]
+Description=School ICAP Guard
+After=network-online.target clamav-daemon.service
+Wants=network-online.target
+Requires=clamav-daemon.service
+
+[Service]
+Type=simple
+User=schoolicap
+Group=schoolicap
+WorkingDirectory=/opt/school-icap-guard
+ExecStart=/opt/school-icap-guard/venv/bin/python /opt/school-icap-guard/school_icap_guard.py --serve --config-dir /etc/school-icap-guard
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/etc/school-icap-guard /opt/school-icap-guard/logs
+
+[Install]
+WantedBy=multi-user.target
