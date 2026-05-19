@@ -42,10 +42,12 @@ import socketserver
 import struct
 import sys
 import tempfile
+import tarfile
 import threading
 import time
 import traceback
 import urllib.parse
+import urllib.request
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, BinaryIO
@@ -60,6 +62,7 @@ MAX_HEADER_LINE = 65536
 MAX_HEADERS_BYTES = 1024 * 1024
 DEFAULT_TEXT_SCAN_BYTES = 2 * 1024 * 1024
 DEFAULT_BODY_LIMIT = 25 * 1024 * 1024
+DEFAULT_UT1_BLACKLIST_URL = "ftp://ftp.ut-capitole.fr/pub/reseau/cache/squidguard_contrib/blacklists.tar.gz"
 
 
 E2G_CATEGORY_CATALOG: list[dict[str, Any]] = [
@@ -486,6 +489,8 @@ class Decision:
             return f"Phrase score te hoog: {self.category}"
         if self.reason == "domain":
             return f"Domein geblokkeerd: {self.category}"
+        if self.reason == "ut1":
+            return f"UT1 categorie geblokkeerd: {self.category}"
         if self.reason == "mime":
             return f"Bestandstype geblokkeerd: {self.category}"
         if self.reason == "oversize":
@@ -797,6 +802,100 @@ class PhraseEngine:
         return dict(scores), hits
 
 
+class DomainBlacklistEngine:
+    """UT1/SquidGuard-style domein- en URL-categorieen."""
+
+    DOMAIN_FILES = {"domains", "domains.txt", "domain", "domains.list"}
+    URL_FILES = {"urls", "urls.txt", "url", "urls.list"}
+
+    def __init__(self, root: pathlib.Path, config: dict[str, Any]) -> None:
+        self.root = root
+        self.config = config
+        self.domain_index: dict[str, set[str]] = collections.defaultdict(set)
+        self.url_rules: dict[str, list[str]] = collections.defaultdict(list)
+        self.category_stats: dict[str, dict[str, int]] = {}
+        self.load_errors: list[str] = []
+        self.load()
+
+    def load(self) -> None:
+        self.domain_index.clear()
+        self.url_rules.clear()
+        self.category_stats.clear()
+        if not self.root.exists():
+            return
+        max_url_rules = int(self.config.get("max_url_rules", 50000))
+        loaded_url_rules = 0
+        for cat_dir in sorted(self.root.iterdir()):
+            if not cat_dir.is_dir():
+                continue
+            category = slugify_key(cat_dir.name)
+            domains = 0
+            urls = 0
+            for file_path in sorted(cat_dir.iterdir()):
+                if not file_path.is_file():
+                    continue
+                name = file_path.name.lower()
+                try:
+                    lines = self._read_rules(file_path)
+                except OSError as exc:
+                    self.load_errors.append(f"{file_path}: {exc}")
+                    continue
+                if name in self.DOMAIN_FILES:
+                    for value in lines:
+                        domain = normalize_domain(value)
+                        if domain:
+                            self.domain_index[domain].add(category)
+                            domains += 1
+                elif name in self.URL_FILES:
+                    remaining = max(0, max_url_rules - loaded_url_rules)
+                    for value in lines[:remaining]:
+                        value = value.strip().lower()
+                        if value:
+                            self.url_rules[category].append(value)
+                            loaded_url_rules += 1
+                            urls += 1
+            if domains or urls:
+                self.category_stats[category] = {"domains": domains, "urls": urls}
+
+    def _read_rules(self, path: pathlib.Path) -> list[str]:
+        rules: list[str] = []
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                line = line.split("\r", 1)[0].strip()
+                if line:
+                    rules.append(line)
+        return rules
+
+    def categories(self) -> list[str]:
+        return sorted(self.category_stats.keys())
+
+    def match(self, domain: str, url: str = "") -> str:
+        domain = normalize_domain(domain)
+        if domain:
+            parts = domain.split(".")
+            for idx in range(len(parts)):
+                candidate = ".".join(parts[idx:])
+                cats = self.domain_index.get(candidate)
+                if cats:
+                    return sorted(cats)[0]
+        url_l = (url or "").lower()
+        if url_l and self.url_rules:
+            for category, patterns in self.url_rules.items():
+                for pattern in patterns:
+                    if pattern and pattern in url_l:
+                        return category
+        return ""
+
+    def total_domains(self) -> int:
+        return sum(item.get("domains", 0) for item in self.category_stats.values())
+
+    def total_urls(self) -> int:
+        return sum(item.get("urls", 0) for item in self.category_stats.values())
+
+
 class DLPValidator:
     CARD_RE = re.compile(r"\b(?:\d[ -]?){13,19}\b")
     IBAN_RE = re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b", re.I)
@@ -1006,6 +1105,7 @@ class PolicyEngine:
         phrase_engine: PhraseEngine,
         dlp_engine: DLPEngine,
         clamav: ClamAVClient,
+        domain_blacklist: DomainBlacklistEngine | None = None,
     ) -> None:
         self.config = config
         self.policies = config.get("policies", {})
@@ -1013,6 +1113,7 @@ class PolicyEngine:
         self.phrase_engine = phrase_engine
         self.dlp_engine = dlp_engine
         self.clamav = clamav
+        self.domain_blacklist = domain_blacklist
 
     def applicable_policies(self, groups: list[str]) -> list[tuple[str, dict[str, Any]]]:
         result = [("common", self.common)]
@@ -1071,6 +1172,16 @@ class PolicyEngine:
                 return Decision(False, "domain", category=context.domain, policy="common")
             if domain_matches(context.domain, blocked_domains):
                 return Decision(False, "domain", category=context.domain, policy=",".join(policy_names))
+            if self.domain_blacklist:
+                ut1_category = self.domain_blacklist.match(context.domain, context.url)
+                if ut1_category and self._ut1_category_enabled(policies, ut1_category):
+                    return Decision(
+                        False,
+                        "ut1",
+                        category=ut1_category,
+                        policy=",".join(policy_names),
+                        details={"domain": context.domain, "url": context.url},
+                    )
 
         bypass_content = domain_is_allowed  # allowlist mag verdere scans overslaan
 
@@ -1108,11 +1219,15 @@ class PolicyEngine:
         # Daarom kijken we hier niet naar response body of headers.
         # ------------------------------------------------------------------
         if dlp_master_on:
-            dlp_body_text = self._dlp_scan_text(context, body)
-            if dlp_body_text:
+            # DLP werkt standaard voor alle groepen, maar alleen op data die de
+            # client zelf verstuurt: REQMOD POST/PUT/PATCH body. Zo blijft DLP
+            # functioneel voor formulieren/uploads zonder gewone webpagina's of
+            # URL's te blokkeren.
+            dlp_scan_text = self._dlp_scan_text(context, body)
+            if dlp_scan_text:
                 dlp_enabled = any(policy.get("dlp_enabled", True) for _, policy in policies)
                 if dlp_enabled:
-                    dlp_score, dlp_hits = self.dlp_engine.scan(dlp_body_text, context.identity.groups)
+                    dlp_score, dlp_hits = self.dlp_engine.scan(dlp_scan_text, context.identity.groups)
                     threshold = self._min_int(policies, "dlp_score_threshold", 50)
                     has_block_hit = any(hit.action == "block" for hit in dlp_hits)
                     if dlp_hits and has_block_hit and dlp_score >= threshold:
@@ -1138,6 +1253,31 @@ class PolicyEngine:
                     return phrase_decision
 
         return Decision(True, "clean", policy=",".join(policy_names), clam=clam_result)
+
+    def _scan_text(self, context: ScanContext, body: bytes) -> str:
+        """Legacy scanbron uit versie 1 voor DLP-compatibiliteit."""
+        parts = [context.url, context.domain, context.request_start, context.response_start]
+        for name, values in context.http_headers.items():
+            if name in {"authorization", "cookie", "set-cookie"}:
+                continue
+            parts.extend(values)
+        if looks_textual(context.content_type, body):
+            text_limit = int(self.config.get("scan", {}).get("text_scan_bytes", DEFAULT_TEXT_SCAN_BYTES))
+            parts.append(decode_body_for_scan(context.content_type, body, text_limit))
+        return "\n".join(part for part in parts if part)
+
+    @staticmethod
+    def _ut1_category_enabled(policies: list[tuple[str, dict[str, Any]]], category: str) -> bool:
+        category = slugify_key(category)
+        for _, policy in policies:
+            values = policy.get("blacklist_categories") or policy.get("ut1_categories") or []
+            if isinstance(values, dict):
+                if parse_bool(str(values.get(category, False)), False):
+                    return True
+                continue
+            if category in {slugify_key(str(item)) for item in values if str(item).strip()}:
+                return True
+        return False
 
     def _dlp_scan_text(self, context: ScanContext, body: bytes) -> str:
         """
@@ -1242,6 +1382,7 @@ class ConfigStore:
         self.users: dict[str, Any] = {}
         self.dlp: dict[str, Any] = {}
         self.phrase_engine: PhraseEngine | None = None
+        self.domain_blacklist: DomainBlacklistEngine | None = None
         self.dlp_engine: DLPEngine | None = None
         self.policy_engine: PolicyEngine | None = None
         self.identity_resolver: IdentityResolver | None = None
@@ -1266,6 +1407,10 @@ class ConfigStore:
     def phrase_root(self) -> pathlib.Path:
         return self.config_dir / "phrases"
 
+    @property
+    def blacklist_root(self) -> pathlib.Path:
+        return self.config_dir / "blacklists" / "ut1"
+
     def ensure_defaults(self) -> None:
         """
         Zorg dat config/users/dlp bestaan en dat elke categorie een MAP
@@ -1280,6 +1425,7 @@ class ConfigStore:
         """
         self.config_dir.mkdir(parents=True, exist_ok=True)
         self.phrase_root.mkdir(parents=True, exist_ok=True)
+        self.blacklist_root.mkdir(parents=True, exist_ok=True)
         if not self.config_path.exists():
             config = default_config()
             config["server"]["dashboard_token"] = secrets.token_urlsafe(24)
@@ -1333,10 +1479,14 @@ class ConfigStore:
             self.users = json.loads(read_text(self.users_path))
             self.dlp = json.loads(read_text(self.dlp_path))
             self.phrase_engine = PhraseEngine(self.phrase_root, self.config.get("phrase_lists", {}))
+            self.domain_blacklist = DomainBlacklistEngine(
+                self.blacklist_root,
+                self.config.get("blacklists", {}).get("ut1", {}),
+            )
             self.dlp_engine = DLPEngine(self.dlp)
             self.clamav = ClamAVClient(self.config.get("clamav", {}))
             self.identity_resolver = IdentityResolver(self.config.get("identity", {}), self.users)
-            self.policy_engine = PolicyEngine(self.config, self.phrase_engine, self.dlp_engine, self.clamav)
+            self.policy_engine = PolicyEngine(self.config, self.phrase_engine, self.dlp_engine, self.clamav, self.domain_blacklist)
             self.version = self._calculate_version()
 
     def _calculate_version(self) -> str:
@@ -1472,6 +1622,12 @@ class ConfigStore:
                 "phrase_rules": len(self.phrase_engine.rules if self.phrase_engine else []),
                 "phrase_categories": sorted(self.phrase_category_counts()),
                 "phrase_errors": self.phrase_engine.load_errors if self.phrase_engine else [],
+                "ut1_blacklist": {
+                    "categories": len(self.domain_blacklist.category_stats) if self.domain_blacklist else 0,
+                    "domains": self.domain_blacklist.total_domains() if self.domain_blacklist else 0,
+                    "urls": self.domain_blacklist.total_urls() if self.domain_blacklist else 0,
+                    "errors": self.domain_blacklist.load_errors if self.domain_blacklist else [],
+                },
                 "dlp_rules": len(self.dlp.get("rules", [])),
                 "dlp_errors": self.dlp_engine.errors if self.dlp_engine else [],
                 "editable_files": self.list_files(),
@@ -1824,12 +1980,12 @@ def block_reason_meta(decision: Decision) -> dict[str, str]:
             "title": "Gevoelige data geblokkeerd",
             "summary": "Een DLP-regel werd geactiveerd om datalekken te voorkomen.",
         }
-    if decision.reason in {"phrase", "domain", "mime", "oversize"}:
+    if decision.reason in {"phrase", "domain", "ut1", "mime", "oversize"}:
         return {
             "label": "Web Filter",
             "tone": "filter",
             "title": "Webcontent geblokkeerd",
-            "summary": "De website, categorie, phrase score of bestandstype valt onder een webfilterpolicy.",
+            "summary": "De website, UT1-categorie, phrase score of bestandstype valt onder een webfilterpolicy.",
         }
     return {
         "label": "Policy",
@@ -1862,6 +2018,11 @@ def render_block_explanation(decision: Decision) -> str:
     elif decision.reason == "domain":
         rows.append(("Module", "Web Filter domeinlijst"))
         rows.append(("Geblokkeerd domein", decision.category or "onbekend"))
+    elif decision.reason == "ut1":
+        rows.append(("Module", "UT1 blacklist"))
+        rows.append(("Categorie", decision.category or "onbekend"))
+        if decision.details.get("domain"):
+            rows.append(("Domein", decision.details.get("domain")))
     elif decision.reason == "mime":
         rows.append(("Module", "Web Filter bestandstype"))
         rows.append(("Content-Type", decision.category or "onbekend"))
@@ -2114,24 +2275,33 @@ def dashboard_policy_snapshot(store: ConfigStore, events: EventLogger) -> dict[s
     config = store.config
     users = store.users
     counts = store.phrase_category_counts()
-    policy_keys = set(config.get("common_policy", {}).get("phrase_thresholds", {}).keys())
+    groups = sorted(config.get("policies", {}).keys())
+    blacklist_stats = store.domain_blacklist.category_stats if store.domain_blacklist else {}
+    policy_keys = set(config.get("common_policy", {}).get("blacklist_categories", []))
     for policy in config.get("policies", {}).values():
-        policy_keys.update(policy.get("phrase_thresholds", {}).keys())
-    category_keys = {entry["key"] for entry in E2G_CATEGORY_CATALOG} | set(counts) | policy_keys
+        policy_keys.update(policy.get("blacklist_categories", []))
+    category_keys = {entry["key"] for entry in E2G_CATEGORY_CATALOG} | set(blacklist_stats) | {slugify_key(str(k)) for k in policy_keys if str(k).strip()}
     categories = []
     phrase_dirs = {path.name for path in store.phrase_root.iterdir() if path.is_dir()} if store.phrase_root.exists() else set()
-    groups = sorted(config.get("policies", {}).keys())
     for key in sorted(category_keys):
         entry = catalog_entry(key)
-        thresholds = {"all": config.get("common_policy", {}).get("phrase_thresholds", {}).get(key)}
+        enabled = {"all": key in set(config.get("common_policy", {}).get("blacklist_categories", []))}
+        phrase_thresholds = {"all": config.get("common_policy", {}).get("phrase_thresholds", {}).get(key)}
         for group in groups:
-            thresholds[group] = config.get("policies", {}).get(group, {}).get("phrase_thresholds", {}).get(key)
+            policy = config.get("policies", {}).get(group, {})
+            enabled[group] = key in set(policy.get("blacklist_categories", []))
+            phrase_thresholds[group] = policy.get("phrase_thresholds", {}).get(key)
+        stats = blacklist_stats.get(key, {"domains": 0, "urls": 0})
         categories.append(
             {
                 **entry,
-                "thresholds": thresholds,
+                "enabled": enabled,
+                "thresholds": phrase_thresholds,
                 "phrase_file": key in phrase_dirs,
                 "phrase_rules": counts.get(key, 0),
+                "blacklist_domains": stats.get("domains", 0),
+                "blacklist_urls": stats.get("urls", 0),
+                "has_blacklist": bool(stats.get("domains", 0) or stats.get("urls", 0)),
             }
         )
 
@@ -2159,9 +2329,11 @@ def dashboard_policy_snapshot(store: ConfigStore, events: EventLogger) -> dict[s
             "active_category_blocks": sum(
                 1
                 for item in categories
-                for value in item["thresholds"].values()
-                if value is not None
+                for value in item["enabled"].values()
+                if value
             ),
+            "ut1_blacklist_domains": store.domain_blacklist.total_domains() if store.domain_blacklist else 0,
+            "ut1_blacklist_urls": store.domain_blacklist.total_urls() if store.domain_blacklist else 0,
             "blocked_domains": sum(1 for row in domain_rows if row["list"] in {"blocked_domains", "hard_blocked_domains"}),
             "dlp_rules": len(store.dlp.get("rules", [])),
             "events": event_snapshot.get("stats", {}).get("total", 0),
@@ -2172,6 +2344,14 @@ def dashboard_policy_snapshot(store: ConfigStore, events: EventLogger) -> dict[s
             **config.get("policies", {}),
         },
         "categories": categories,
+        "blacklist": {
+            "source_url": config.get("blacklists", {}).get("ut1", {}).get("source_url", DEFAULT_UT1_BLACKLIST_URL),
+            "last_import": config.get("blacklists", {}).get("ut1", {}).get("last_import", ""),
+            "category_count": len(store.domain_blacklist.category_stats) if store.domain_blacklist else 0,
+            "domain_count": store.domain_blacklist.total_domains() if store.domain_blacklist else 0,
+            "url_count": store.domain_blacklist.total_urls() if store.domain_blacklist else 0,
+            "errors": store.domain_blacklist.load_errors if store.domain_blacklist else [],
+        },
         "domains": domain_rows,
         "users": users.get("users", {}),
         "ip_map": users.get("ip_map", {}),
@@ -2186,18 +2366,131 @@ def dashboard_update_category(store: ConfigStore, data: dict[str, Any]) -> dict[
     config = editable_config(store)
     category = slugify_key(str(data.get("category", "")))
     target, policy = policy_target(config, str(data.get("target", "all")))
-    thresholds = policy.setdefault("phrase_thresholds", {})
     enabled = parse_bool(str(data.get("enabled", "true")), True)
+    categories = [slugify_key(str(item)) for item in policy.setdefault("blacklist_categories", []) if str(item).strip()]
     if enabled:
-        entry = catalog_entry(category)
-        threshold = int(data.get("threshold") or entry.get("default_threshold", 80))
-        thresholds[category] = threshold
-        if parse_bool(str(data.get("create_phrase_file", "true")), True):
-            store.ensure_phrase_category(category)
+        if category not in categories:
+            categories.append(category)
     else:
-        thresholds.pop(category, None)
+        categories = [item for item in categories if item != category]
+    policy["blacklist_categories"] = sorted(set(categories))
     store.save_config_data(config)
     return {"ok": True, "target": target, "category": category, "enabled": enabled}
+
+
+def _safe_extract_tar(tar: tarfile.TarFile, dest: pathlib.Path) -> None:
+    dest_resolved = dest.resolve()
+    for member in tar.getmembers():
+        member_path = (dest / member.name).resolve()
+        if dest_resolved != member_path and dest_resolved not in member_path.parents:
+            raise ValueError(f"onveilige tar entry: {member.name}")
+    tar.extractall(dest)
+
+
+def import_ut1_blacklist_archive(store: ConfigStore, archive_path: pathlib.Path, source: str = "upload") -> dict[str, Any]:
+    temp_root = pathlib.Path(tempfile.mkdtemp(prefix="ut1-import-", dir=str(store.config_dir)))
+    extracted = temp_root / "extract"
+    extracted.mkdir(parents=True, exist_ok=True)
+    try:
+        with tarfile.open(archive_path, "r:*") as tar:
+            _safe_extract_tar(tar, extracted)
+        pairs: dict[str, dict[str, pathlib.Path]] = {}
+        known_files = DomainBlacklistEngine.DOMAIN_FILES | DomainBlacklistEngine.URL_FILES
+        for file_path in extracted.rglob("*"):
+            if not file_path.is_file():
+                continue
+            name = file_path.name.lower()
+            if name not in known_files:
+                continue
+            category = slugify_key(file_path.parent.name)
+            pairs.setdefault(category, {})["domains" if name in DomainBlacklistEngine.DOMAIN_FILES else "urls"] = file_path
+        if not pairs:
+            raise ValueError("geen UT1/SquidGuard categories gevonden in archive")
+        target_root = store.blacklist_root
+        if target_root.exists() and any(target_root.iterdir()):
+            backup_root = target_root.with_name("ut1.backup." + _dt.datetime.now().strftime("%Y%m%d-%H%M%S"))
+            os.replace(target_root, backup_root)
+        target_root.mkdir(parents=True, exist_ok=True)
+        for category, files in pairs.items():
+            cat_dir = target_root / category
+            cat_dir.mkdir(parents=True, exist_ok=True)
+            for kind, src in files.items():
+                shutil.copy2(src, cat_dir / kind)
+        config = editable_config(store)
+        ut1_cfg = config.setdefault("blacklists", {}).setdefault("ut1", {})
+        ut1_cfg["enabled"] = True
+        ut1_cfg["source_url"] = source or ut1_cfg.get("source_url", DEFAULT_UT1_BLACKLIST_URL)
+        ut1_cfg["last_import"] = utc_now()
+        ut1_cfg["category_count"] = len(pairs)
+        store.save_config_data(config)
+        return {"ok": True, "categories": len(pairs), "source": source}
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def dashboard_import_blacklist_url(store: ConfigStore, data: dict[str, Any]) -> dict[str, Any]:
+    url = str(data.get("url") or DEFAULT_UT1_BLACKLIST_URL).strip()
+    if not url:
+        raise ValueError("blacklist URL is leeg")
+    if not re.match(r"^(https?|ftp)://", url, re.I):
+        raise ValueError("gebruik een http(s):// of ftp:// URL")
+    tmp_dir = pathlib.Path(tempfile.mkdtemp(prefix="ut1-download-", dir=str(store.config_dir)))
+    archive_path = tmp_dir / "blacklists.tar.gz"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
+        with urllib.request.urlopen(req, timeout=120) as response, archive_path.open("wb") as out:
+            shutil.copyfileobj(response, out, length=1024 * 1024)
+        result = import_ut1_blacklist_archive(store, archive_path, source=url)
+        result["url"] = url
+        return result
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _extract_multipart_file(content_type: str, payload: bytes, field_name: str = "file") -> tuple[str, bytes]:
+    match = re.search(r'boundary=(?:"([^"]+)"|([^;]+))', content_type or "", re.I)
+    if not match:
+        raise ValueError("multipart boundary ontbreekt")
+    boundary_text = (match.group(1) or match.group(2) or "").strip()
+    if not boundary_text:
+        raise ValueError("multipart boundary is leeg")
+    boundary = ("--" + boundary_text).encode("utf-8", errors="replace")
+    for raw_part in payload.split(boundary):
+        part = raw_part.strip(b"\r\n")
+        if not part or part == b"--":
+            continue
+        if part.endswith(b"--"):
+            part = part[:-2].rstrip(b"\r\n")
+        if b"\r\n\r\n" in part:
+            header_blob, body = part.split(b"\r\n\r\n", 1)
+        elif b"\n\n" in part:
+            header_blob, body = part.split(b"\n\n", 1)
+        else:
+            continue
+        headers_text = header_blob.decode("utf-8", errors="replace")
+        if f'name="{field_name}"' not in headers_text and f"name={field_name}" not in headers_text:
+            continue
+        filename_match = re.search(r'filename="([^"]*)"|filename=([^;\r\n]+)', headers_text, re.I)
+        filename = (filename_match.group(1) or filename_match.group(2) or "blacklists.tar.gz") if filename_match else "blacklists.tar.gz"
+        return pathlib.Path(filename.strip()).name or "blacklists.tar.gz", body
+    raise ValueError("geen bestand geupload")
+
+
+def dashboard_import_blacklist_upload(handler: BaseHTTPRequestHandler, store: ConfigStore) -> dict[str, Any]:
+    length = int(handler.headers.get("Content-Length", "0"))
+    if length <= 0:
+        raise ValueError("upload is leeg")
+    payload = handler.rfile.read(length)
+    filename, file_bytes = _extract_multipart_file(handler.headers.get("Content-Type", ""), payload)
+    if not file_bytes:
+        raise ValueError("uploadbestand is leeg")
+    tmp_dir = pathlib.Path(tempfile.mkdtemp(prefix="ut1-upload-", dir=str(store.config_dir)))
+    archive_path = tmp_dir / filename
+    try:
+        archive_path.write_bytes(file_bytes)
+        return import_ut1_blacklist_archive(store, archive_path, source=f"upload:{filename}")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def dashboard_update_domain(store: ConfigStore, data: dict[str, Any]) -> dict[str, Any]:
@@ -2808,6 +3101,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": True, "status": self.server.store.status()})
             elif parsed.path == "/api/policy/category":
                 self._send_json(dashboard_update_category(self.server.store, self._read_json_body()))
+            elif parsed.path == "/api/blacklist/import":
+                self._send_json(dashboard_import_blacklist_url(self.server.store, self._read_json_body()))
+            elif parsed.path == "/api/blacklist/upload":
+                self._send_json(dashboard_import_blacklist_upload(self, self.server.store))
             elif parsed.path == "/api/policy/domain":
                 self._send_json(dashboard_update_domain(self.server.store, self._read_json_body()))
             elif parsed.path == "/api/policy/group":
@@ -2874,7 +3171,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             clamav = ClamAVClient({"enabled": False})
             assert store.phrase_engine is not None
             assert store.dlp_engine is not None
-            engine = PolicyEngine(store.config, store.phrase_engine, store.dlp_engine, clamav)
+            engine = PolicyEngine(store.config, store.phrase_engine, store.dlp_engine, clamav, store.domain_blacklist)
         else:
             engine = self.server.store.policy_engine
             assert engine is not None
@@ -3517,7 +3814,7 @@ DASHBOARD_JS = r"""
     '/users': ['Gebruikers', 'NetBird- en lokale gebruikers'],
     '/policies': ['Policies', 'Groepsbeleid en regels'],
     '/domains': ['Domeinen', 'Blocklist en allowlist beheer'],
-    '/categories': ['Categorieen', 'Webfilter categorie thresholds'],
+    '/categories': ['Categorieen', 'UT1 blacklist per groep'],
     '/phrases': ['Weighted phrases', 'Beheer weighted phrase lists'],
     '/dlp': ['Data Loss Prevention', 'DLP regels en gevoelige data'],
     '/services': ['Services', 'Status van alle modules'],
@@ -4083,83 +4380,125 @@ DASHBOARD_JS = r"""
 
   // ---------- VIEW: CATEGORIES ----------
   async function renderCategories() {
-    const data = await api('/api/policy');
+    let data = await api('/api/policy');
     const groups = ['all', ...(data.groups || [])];
-    const settings = (await api('/api/settings')).settings || {};
+    const blacklist = data.blacklist || {};
+    const sourceUrl = blacklist.source_url || 'ftp://ftp.ut-capitole.fr/pub/reseau/cache/squidguard_contrib/blacklists.tar.gz';
 
-    function paint(targetGroup, search) {
+    function enabledFor(c, group) {
+      return !!(c.enabled && c.enabled[group]);
+    }
+
+    function paint(search) {
       const rows = (data.categories || []).filter(c => {
         if (!search) return true;
         const t = `${c.key} ${c.en} ${c.nl}`.toLowerCase();
         return t.includes(search);
       }).map(c => {
-        const direct = c.thresholds[targetGroup] !== null && c.thresholds[targetGroup] !== undefined;
-        const inherited = targetGroup !== 'all' && c.thresholds.all !== null && c.thresholds.all !== undefined;
-        const value = direct ? c.thresholds[targetGroup] : (c.default_threshold || 80);
-        const active = direct || inherited;
-        return `<div class="category-item ${active ? 'active' : ''} risk-${esc(c.risk)}" data-cat="${esc(c.key)}">
-          <div class="title">${esc(c.nl)} <span class="sub">${esc(c.en)} · ${esc(c.risk)}</span></div>
-          <div class="sub">${esc(c.phrase_rules || 0)} phrases${c.phrase_file ? '' : ' · nog geen phrase file'}</div>
-          ${inherited ? `<div class="sub"><span class="badge info">overge&euml;rfd van Alle groepen</span></div>` : ''}
-          <div class="row">
-            <input class="field threshold-input" type="number" min="1" max="999" value="${esc(value)}" style="max-width: 90px; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface); color: var(--text);">
-            <button class="btn primary" data-action="cat-on" data-key="${esc(c.key)}">Blokkeer / opslaan</button>
-            ${direct ? `<button class="btn danger" data-action="cat-off" data-key="${esc(c.key)}">Deblokkeer</button>` : ''}
-          </div>
-        </div>`;
-      }).join('') || emptyState('Geen categorieen', 'Pas je zoekterm aan.');
-      document.getElementById('cat-list').innerHTML = rows;
-      bindCatActions();
-    }
-    function bindCatActions() {
-      view.querySelectorAll('[data-action="cat-on"]').forEach(btn => btn.addEventListener('click', async () => {
-        const item = btn.closest('.category-item');
-        const threshold = item.querySelector('.threshold-input').value;
-        try {
-          await post('/api/policy/category', { target: document.getElementById('cat-group').value, category: btn.dataset.key, enabled: true, threshold });
-          toast('Categorie opgeslagen', true);
-          const updated = await api('/api/policy');
-          Object.assign(data, updated);
-          paint(document.getElementById('cat-group').value, document.getElementById('cat-search').value.toLowerCase());
-        } catch (e) { toast(e.message, false); }
-      }));
-      view.querySelectorAll('[data-action="cat-off"]').forEach(btn => btn.addEventListener('click', async () => {
-        try {
-          await post('/api/policy/category', { target: document.getElementById('cat-group').value, category: btn.dataset.key, enabled: false });
-          toast('Categorie gedeblokkeerd', true);
-          const updated = await api('/api/policy');
-          Object.assign(data, updated);
-          paint(document.getElementById('cat-group').value, document.getElementById('cat-search').value.toLowerCase());
-        } catch (e) { toast(e.message, false); }
-      }));
+        const toggles = groups.map(g => {
+          const on = enabledFor(c, g);
+          return `<td>
+            <button class="btn ${on ? 'primary' : ''}" data-action="ut1-toggle" data-group="${esc(g)}" data-key="${esc(c.key)}" data-enabled="${on ? 'false' : 'true'}">
+              ${on ? 'Aan' : 'Uit'}
+            </button>
+          </td>`;
+        }).join('');
+        return `<tr data-search="${esc(`${c.key} ${c.en} ${c.nl}`.toLowerCase())}">
+          <td><strong>${esc(c.nl)}</strong><br><span class="hint">${esc(c.en)} · ${esc(c.key)}</span></td>
+          <td>${c.has_blacklist ? badge('UT1 aanwezig', 'ok') : badge('nog niet geimporteerd', 'neutral')}</td>
+          <td>${fmtNum(c.blacklist_domains || 0)}</td>
+          <td>${fmtNum(c.blacklist_urls || 0)}</td>
+          ${toggles}
+        </tr>`;
+      }).join('') || `<tr><td colspan="${4 + groups.length}">${emptyState('Geen categorieen', 'Importeer eerst de UT1 blacklist of pas je zoekterm aan.')}</td></tr>`;
+      document.getElementById('ut1-tbody').innerHTML = rows;
+      bindToggles();
     }
 
-    const phrasesNote = settings.weighted_phrases_enabled ? '' : `
-      <div class="empty">
-        <strong>Weighted phrases staan globaal UIT.</strong>
-        <span>Categorie thresholds zijn ingesteld, maar phrase-blocking is pas actief als je weighted phrases inschakelt via Instellingen.</span>
-      </div>`;
+    function bindToggles() {
+      view.querySelectorAll('[data-action="ut1-toggle"]').forEach(btn => btn.addEventListener('click', async () => {
+        try {
+          await post('/api/policy/category', { target: btn.dataset.group, category: btn.dataset.key, enabled: btn.dataset.enabled === 'true' });
+          toast('UT1 categorie aangepast', true);
+          data = await api('/api/policy');
+          paint(document.getElementById('cat-search').value.toLowerCase());
+        } catch (e) { toast(e.message, false); }
+      }));
+    }
 
     view.innerHTML = `
       <section class="panel">
         <header class="panel-head">
-          <div><h2>Categorieen</h2><p class="hint">UT1-style categorieen met threshold per groep. Allowlist overrulet altijd.</p></div>
+          <div>
+            <h2>UT1 blacklist</h2>
+            <p class="hint">Deze pagina beheert domein/URL-categorieen uit de UT1/SquidGuard blacklist. Dit staat los van weighted phrases.</p>
+          </div>
+          <div>${badge((blacklist.category_count || 0) + ' categorieen', (blacklist.category_count || 0) ? 'ok' : 'neutral')}</div>
         </header>
-        ${phrasesNote}
-        <form class="row" onsubmit="return false;">
-          <label class="field"><span>Groep</span>
-            <select id="cat-group">${groups.map(g => `<option value="${esc(g)}">${esc(g === 'all' ? 'Alle groepen' : g)}</option>`).join('')}</select>
-          </label>
-          <label class="field"><span>Zoeken</span><input id="cat-search" placeholder="adult, malware, gokken..."></label>
+        <div class="cards">
+          <div class="stat-card"><span>Categorieen</span><strong>${fmtNum(blacklist.category_count || 0)}</strong><small>geladen uit UT1</small></div>
+          <div class="stat-card"><span>Domeinen</span><strong>${fmtNum(blacklist.domain_count || 0)}</strong><small>snelle domeinmatching</small></div>
+          <div class="stat-card"><span>URL-regels</span><strong>${fmtNum(blacklist.url_count || 0)}</strong><small>substring matching beperkt</small></div>
+          <div class="stat-card"><span>Laatste import</span><strong>${blacklist.last_import ? esc(fmtTs(blacklist.last_import)) : '-'}</strong><small>bron: UT1</small></div>
+        </div>
+        ${(blacklist.errors || []).length ? `<div class="empty"><strong>Load errors</strong><span>${esc((blacklist.errors || []).join(' | '))}</span></div>` : ''}
+      </section>
+
+      <section class="panel">
+        <header class="panel-head">
+          <div><h2>Blacklist toevoegen / updaten</h2><p class="hint">Default staat op de officiele UT1 blacklist URL. Na import wordt de engine automatisch herladen.</p></div>
+        </header>
+        <form id="ut1-url-form" class="row" onsubmit="return false;">
+          <label class="field" style="flex:1 1 520px"><span>Blacklist URL</span><input id="ut1-url" value="${esc(sourceUrl)}" placeholder="ftp://ftp.ut-capitole.fr/pub/reseau/cache/squidguard_contrib/blacklists.tar.gz"></label>
+          <button class="btn primary" id="ut1-import-url">Importeer URL</button>
+        </form>
+        <form id="ut1-upload-form" class="row" onsubmit="return false;" enctype="multipart/form-data">
+          <label class="field" style="flex:1 1 360px"><span>Of upload lokaal .tar.gz bestand</span><input id="ut1-file" type="file" accept=".gz,.tgz,.tar"></label>
+          <button class="btn" id="ut1-import-file">Upload/importeer</button>
         </form>
       </section>
+
       <section class="panel">
-        <div id="cat-list" class="category-list"></div>
+        <header class="panel-head">
+          <div><h2>Categorieen per groep</h2><p class="hint">Zet categorieen aan/uit per groep. <strong>Alle groepen</strong> is globaal; specifieke NetBird-groepen staan daarnaast.</p></div>
+          <label class="field compact"><span>Zoeken</span><input id="cat-search" placeholder="adult, malware, social..."></label>
+        </header>
+        <div class="table-wrap">
+          <table class="data">
+            <thead><tr><th>Categorie</th><th>Status</th><th>Domeinen</th><th>URL's</th>${groups.map(g => `<th>${esc(g === 'all' ? 'Alle groepen' : g)}</th>`).join('')}</tr></thead>
+            <tbody id="ut1-tbody"></tbody>
+          </table>
+        </div>
       </section>
     `;
-    document.getElementById('cat-group').addEventListener('change', () => paint(document.getElementById('cat-group').value, document.getElementById('cat-search').value.toLowerCase()));
-    document.getElementById('cat-search').addEventListener('input', () => paint(document.getElementById('cat-group').value, document.getElementById('cat-search').value.toLowerCase()));
-    paint('all', '');
+
+    document.getElementById('cat-search').addEventListener('input', (ev) => paint(ev.target.value.toLowerCase()));
+    document.getElementById('ut1-import-url').addEventListener('click', async () => {
+      const url = document.getElementById('ut1-url').value.trim();
+      try {
+        toast('UT1 import gestart...', true);
+        await post('/api/blacklist/import', { url });
+        toast('UT1 blacklist geimporteerd', true);
+        data = await api('/api/policy');
+        navigate('/categories', true);
+      } catch (e) { toast(e.message, false); }
+    });
+    document.getElementById('ut1-import-file').addEventListener('click', async () => {
+      const input = document.getElementById('ut1-file');
+      if (!input.files || !input.files[0]) { toast('Kies eerst een bestand', false); return; }
+      const form = new FormData();
+      form.append('file', input.files[0]);
+      try {
+        toast('Upload/import gestart...', true);
+        const res = await fetch('/api/blacklist/upload', { method: 'POST', body: form });
+        const payload = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(payload.error || res.statusText);
+        toast('UT1 upload geimporteerd', true);
+        data = await api('/api/policy');
+        navigate('/categories', true);
+      } catch (e) { toast(e.message, false); }
+    });
+    paint('');
   }
 
   // ---------- VIEW: PHRASES ----------
@@ -4750,6 +5089,13 @@ def default_config() -> dict[str, Any]:
             "extensions": [".weightedphraselist", ".phraselist", ".txt"],
             "match_individual_tags": False,
         },
+        "blacklists": {
+            "ut1": {
+                "enabled": True,
+                "source_url": DEFAULT_UT1_BLACKLIST_URL,
+                "max_url_rules": 50000,
+            }
+        },
         "identity": {
             # Default group wordt enkel gebruikt als er geen NetBird-/Entra
             # info beschikbaar is. Het maakt geen policy aan; gebruikers
@@ -4780,6 +5126,9 @@ def default_config() -> dict[str, Any]:
                 "application/x-dosexec",
                 "application/vnd.microsoft.portable-executable",
             ],
+            # UT1 blacklist-categorieen. Deze staan los van weighted phrases.
+            # Beheerder zet categorieen per groep aan via de Categories-pagina.
+            "blacklist_categories": [],
             # Phrase thresholds zijn standaard leeg. Beheerder activeert
             # ze pas wanneer weighted phrases bewust aanstaat.
             "phrase_thresholds": {},
