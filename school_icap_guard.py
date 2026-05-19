@@ -1490,12 +1490,60 @@ class ConfigStore:
             self.policy_engine = PolicyEngine(self.config, self.phrase_engine, self.dlp_engine, self.clamav, self.domain_blacklist)
             self.version = self._calculate_version()
 
+    def reload_config_only(self) -> None:
+        """
+        Herlaad alleen config.json en bouw de policy engine opnieuw op.
+
+        Belangrijk voor de Categories-pagina: een categorie aan/uit zetten mag
+        de volledige UT1 blacklist niet opnieuw vanaf disk laden. Bij grote
+        UT1 imports kan zo'n volledige reload lang genoeg duren dat Squid zijn
+        periodieke ICAP OPTIONS fetch laat timeouten en de service als down
+        markeert.
+        """
+        with self.lock:
+            user_config = json.loads(read_text(self.config_path))
+            self.config = deep_merge(default_config(), user_config)
+            if self.phrase_engine is None:
+                self.phrase_engine = PhraseEngine(self.phrase_root, self.config.get("phrase_lists", {}))
+            if self.domain_blacklist is None:
+                self.domain_blacklist = DomainBlacklistEngine(
+                    self.blacklist_root,
+                    self.config.get("blacklists", {}).get("ut1", {}),
+                )
+            if self.dlp_engine is None:
+                self.dlp_engine = DLPEngine(self.dlp)
+            self.clamav = ClamAVClient(self.config.get("clamav", {}))
+            self.identity_resolver = IdentityResolver(self.config.get("identity", {}), self.users)
+            self.policy_engine = PolicyEngine(self.config, self.phrase_engine, self.dlp_engine, self.clamav, self.domain_blacklist)
+            self.version = self._calculate_version()
+
+    def reload_users_only(self) -> None:
+        with self.lock:
+            self.users = json.loads(read_text(self.users_path))
+            self.identity_resolver = IdentityResolver(self.config.get("identity", {}), self.users)
+            self.policy_engine = PolicyEngine(self.config, self.phrase_engine, self.dlp_engine, self.clamav, self.domain_blacklist)
+            self.version = self._calculate_version()
+
+    def reload_dlp_only(self) -> None:
+        with self.lock:
+            self.dlp = json.loads(read_text(self.dlp_path))
+            self.dlp_engine = DLPEngine(self.dlp)
+            self.policy_engine = PolicyEngine(self.config, self.phrase_engine, self.dlp_engine, self.clamav, self.domain_blacklist)
+            self.version = self._calculate_version()
+
     def _calculate_version(self) -> str:
         digest = hashlib.sha256()
+        skip_dirs = {"blacklists", "logs", ".backups", "tmp"}
         for path in sorted(self.config_dir.rglob("*")):
-            if path.is_file():
-                digest.update(str(path.relative_to(self.config_dir)).encode())
-                digest.update(path.read_bytes())
+            if not path.is_file():
+                continue
+            rel = path.relative_to(self.config_dir)
+            if rel.parts and rel.parts[0] in skip_dirs:
+                continue
+            if any(part.startswith("ut1-download-") or part.startswith("ut1-import-") or part.startswith("ut1-upload-") for part in rel.parts):
+                continue
+            digest.update(str(rel).encode())
+            digest.update(path.read_bytes())
         return digest.hexdigest()[:16]
 
     def istag(self) -> str:
@@ -1563,7 +1611,7 @@ class ConfigStore:
         atomic_text_write(path, content)
         self.reload()
 
-    def _save_json_path(self, path: pathlib.Path, data: dict[str, Any]) -> None:
+    def _save_json_path(self, path: pathlib.Path, data: dict[str, Any], reload_after: str = "full") -> None:
         with self.lock:
             if path.exists():
                 backup_dir = self.config_dir / ".backups"
@@ -1571,16 +1619,23 @@ class ConfigStore:
                 stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
                 shutil.copy2(path, backup_dir / f"{path.name}.{stamp}.bak")
             atomic_text_write(path, safe_json(data) + "\n")
+        if reload_after == "config":
+            self.reload_config_only()
+        elif reload_after == "users":
+            self.reload_users_only()
+        elif reload_after == "dlp":
+            self.reload_dlp_only()
+        elif reload_after == "full":
             self.reload()
 
     def save_config_data(self, data: dict[str, Any]) -> None:
-        self._save_json_path(self.config_path, data)
+        self._save_json_path(self.config_path, data, reload_after="config")
 
     def save_users_data(self, data: dict[str, Any]) -> None:
-        self._save_json_path(self.users_path, data)
+        self._save_json_path(self.users_path, data, reload_after="users")
 
     def save_dlp_data(self, data: dict[str, Any]) -> None:
-        self._save_json_path(self.dlp_path, data)
+        self._save_json_path(self.dlp_path, data, reload_after="dlp")
 
     def ensure_phrase_category(self, category: str) -> pathlib.Path:
         key = slugify_key(category)
