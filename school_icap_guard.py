@@ -9,7 +9,7 @@ Single-file ICAP service for Squid/OPNsense deployments:
 * ClamAV/clamd scanning over TCP or Unix socket.
 * DLP regex and validator rules.
 * E2Guardian/DansGuardian-style weighted phrase lists.
-* Group policies for common, NetBird, Entra, and custom groups.
+* Group policies for common, student, teacher, and custom groups.
 * NetBird/Entra-aware identity mapping through trusted proxy headers and a
   local JSON mapping file.
 * Built-in dashboard for editing config and phrase files.
@@ -219,41 +219,6 @@ def catalog_entry(category: str) -> dict[str, Any]:
         "default_threshold": 80,
         "risk": "custom",
     }
-
-
-
-def normalize_phrase_policy_defaults(config: dict[str, Any]) -> dict[str, Any]:
-    def clean_policy(policy: dict[str, Any]) -> None:
-        thresholds = policy.get("phrase_thresholds", {})
-        if isinstance(thresholds, dict):
-            cleaned: dict[str, int] = {}
-            for category, value in thresholds.items():
-                try:
-                    threshold = int(value)
-                except (TypeError, ValueError):
-                    continue
-                if threshold > 0:
-                    cleaned[str(category)] = threshold
-            policy["phrase_thresholds"] = cleaned
-        else:
-            policy["phrase_thresholds"] = {}
-
-        total_threshold = policy.get("phrase_total_threshold")
-        try:
-            total_threshold_int = int(total_threshold)
-        except (TypeError, ValueError):
-            total_threshold_int = 0
-        if total_threshold_int > 0:
-            policy["phrase_total_threshold"] = total_threshold_int
-        else:
-            policy.pop("phrase_total_threshold", None)
-
-    common = config.setdefault("common_policy", {})
-    clean_policy(common)
-    for policy in config.setdefault("policies", {}).values():
-        if isinstance(policy, dict):
-            clean_policy(policy)
-    return config
 
 
 def domain_matches(domain: str, patterns: list[str]) -> bool:
@@ -529,46 +494,83 @@ class Decision:
 
 
 class EventLogger:
-    def __init__(self, log_dir: pathlib.Path, max_memory: int = 1000) -> None:
+    """
+    Persistente logger voor allow/block events.
+
+    Events worden in JSON Lines geschreven naar ``events.jsonl`` en
+    bovendien in een ringbuffer in geheugen bewaard voor het dashboard.
+    Bij opstart worden de laatste ``max_memory`` regels uit het bestand
+    teruggelezen, zodat het dashboard na een restart of NetBird-sync nog
+    steeds historische events toont. Corrupte regels worden overgeslagen
+    in plaats van de service te crashen.
+    """
+
+    def __init__(
+        self,
+        log_dir: pathlib.Path,
+        max_memory: int = 1000,
+        max_file_bytes: int = 50 * 1024 * 1024,
+    ) -> None:
         self.log_dir = log_dir
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.path = log_dir / "events.jsonl"
-        self.recent: collections.deque[dict[str, Any]] = collections.deque(maxlen=max_memory)
+        self.max_memory = int(max_memory)
+        self.max_file_bytes = int(max_file_bytes)
+        self.recent: collections.deque[dict[str, Any]] = collections.deque(maxlen=self.max_memory)
         self.lock = threading.Lock()
-        self.stats = collections.Counter()
+        self.stats: collections.Counter[str] = collections.Counter()
+        self.load_errors: list[str] = []
         self._load_existing()
 
     def _load_existing(self) -> None:
         if not self.path.exists():
             return
-        loaded: list[dict[str, Any]] = []
-        corrupt = 0
+        try:
+            self._rotate_if_needed()
+        except OSError as exc:
+            self.load_errors.append(f"rotate failed: {exc}")
         try:
             with self.path.open("r", encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError:
-                        corrupt += 1
-                        continue
-                    if not isinstance(event, dict):
-                        corrupt += 1
-                        continue
-                    loaded.append(event)
-                    self.stats["total"] += 1
-                    self.stats[event.get("action", "unknown")] += 1
-                    if event.get("reason"):
-                        self.stats[f"reason:{event['reason']}"] += 1
-            for event in loaded[-self.recent.maxlen :]:
-                self.recent.appendleft(event)
-            if corrupt:
-                self.stats["corrupt_lines"] = corrupt
+                lines = fh.readlines()
         except OSError as exc:
-            self.stats["load_error"] = 1
-            logging.warning("Could not load persisted events from %s: %s", self.path, exc)
+            self.load_errors.append(f"read failed: {exc}")
+            return
+        # totale stats over hele bestand bijhouden
+        for raw in lines:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            self.stats["total"] += 1
+            self.stats[event.get("action", "unknown")] += 1
+        # alleen de laatste max_memory in geheugen plaatsen (jongste eerst)
+        tail = lines[-self.max_memory :]
+        for raw in tail:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                self.load_errors.append(f"corrupt line skipped: {exc}")
+                continue
+            self.recent.appendleft(event)
+
+    def _rotate_if_needed(self) -> None:
+        try:
+            size = self.path.stat().st_size
+        except OSError:
+            return
+        if size <= self.max_file_bytes:
+            return
+        rotated = self.path.with_suffix(".jsonl." + _dt.datetime.now().strftime("%Y%m%d-%H%M%S") + ".old")
+        try:
+            os.replace(self.path, rotated)
+        except OSError as exc:
+            self.load_errors.append(f"rotate failed: {exc}")
 
     def emit(self, event: dict[str, Any]) -> None:
         event.setdefault("ts", utc_now())
@@ -577,10 +579,30 @@ class EventLogger:
             self.recent.appendleft(event)
             self.stats["total"] += 1
             self.stats[event.get("action", "unknown")] += 1
-            if event.get("reason"):
-                self.stats[f"reason:{event['reason']}"] += 1
-            with self.path.open("a", encoding="utf-8") as fh:
-                fh.write(line + "\n")
+            try:
+                with self.path.open("a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+            except OSError as exc:
+                logging.error("event log write failed: %s", exc)
+
+    def all_events(self) -> list[dict[str, Any]]:
+        """Lees ALLE events uit events.jsonl. Voor de logspagina."""
+        if not self.path.exists():
+            return []
+        events: list[dict[str, Any]] = []
+        try:
+            with self.path.open("r", encoding="utf-8", errors="replace") as fh:
+                for raw in fh:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        events.append(json.loads(raw))
+                    except json.JSONDecodeError:
+                        continue
+        except OSError as exc:
+            logging.error("event log read failed: %s", exc)
+        return events
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
@@ -588,6 +610,7 @@ class EventLogger:
                 "stats": dict(self.stats),
                 "recent": list(self.recent),
                 "log_path": str(self.path),
+                "load_errors": list(self.load_errors),
             }
 
 
@@ -679,8 +702,6 @@ class PhraseEngine:
     def load(self) -> None:
         self.rules.clear()
         self.load_errors.clear()
-        if not bool(self.config.get("enabled", False)):
-            return
         if not self.phrase_root.exists():
             return
         extensions = tuple(self.config.get("extensions", [".weightedphraselist", ".phraselist", ".txt"]))
@@ -947,7 +968,9 @@ class IdentityResolver:
                 source = "entra_group_header"
 
         if not groups:
-            groups.append(str(self.config.get("default_group", "default")))
+            default_group = str(self.config.get("default_group", "")).strip()
+            if default_group:
+                groups.append(default_group)
         groups = sorted({g for g in groups if g})
         if not username:
             username = f"ip:{source_ip}" if source_ip else "anonymous"
@@ -998,18 +1021,42 @@ class PolicyEngine:
             if policy:
                 result.append((group, policy))
         if len(result) == 1:
-            fallback = self.config.get("identity", {}).get("default_group", "default")
-            if fallback in self.policies:
+            fallback = str(self.config.get("identity", {}).get("default_group", "")).strip()
+            if fallback and fallback in self.policies:
                 result.append((fallback, self.policies[fallback]))
         return result
 
     def evaluate(self, context: ScanContext, body: bytes) -> Decision:
         policies = self.applicable_policies(context.identity.groups)
         policy_names = [name for name, _ in policies]
-        webfilter_enabled = any(policy.get("webfiltering_enabled", True) for _, policy in policies)
-        domain_blocking_enabled = webfilter_enabled and any(
-            policy.get("domain_blocking_enabled", True) for _, policy in policies
+
+        # ------------------------------------------------------------------
+        # STAP 1: Allowlist heeft ALTIJD prioriteit boven blacklist/UT1.
+        # Een handmatig toegelaten domein overrulet altijd blacklist en
+        # UT1-categorieen. Dit komt eerst, zodat er nooit een conflict is.
+        # ------------------------------------------------------------------
+        allowed_domains = self._list_union(policies, "allowed_domains")
+        allow_bypasses = any(
+            bool(policy.get("allow_domains_bypass_content", True))
+            for _, policy in policies
         )
+        domain_is_allowed = domain_matches(context.domain, allowed_domains) if context.domain else False
+        if domain_is_allowed and allow_bypasses:
+            return Decision(
+                True,
+                "allowlist_override",
+                category=context.domain,
+                policy=",".join(policy_names),
+                details={"matched_allowlist": True},
+            )
+
+        settings = self.config.get("settings", {}) or {}
+        webfilter_on = bool(settings.get("webfilter_enabled", True))
+        domain_blocking_on = bool(settings.get("domain_blocking_enabled", True))
+        weighted_phrases_on = bool(settings.get("weighted_phrases_enabled", False))
+        dlp_master_on = bool(settings.get("dlp_enabled", True))
+        antivirus_master_on = bool(settings.get("antivirus_enabled", True))
+
         body_limit = self._min_int(policies, "max_body_bytes", DEFAULT_BODY_LIMIT)
         if len(body) > body_limit:
             action = self._first_value(policies, "oversize_action", "allow").lower()
@@ -1018,32 +1065,23 @@ class PolicyEngine:
 
         blocked_domains = self._list_union(policies, "blocked_domains")
         hard_blocked_domains = self._list_union(policies, "hard_blocked_domains")
-        allowed_domains = self._list_union(policies, "allowed_domains")
-        allow_bypasses = any(bool(policy.get("allow_domains_bypass_content", False)) for _, policy in policies)
 
-        if domain_matches(context.domain, allowed_domains):
-            return Decision(
-                True,
-                "allowed_domain",
-                policy=",".join(policy_names),
-                details={"allowlist_priority": "allowed domains are evaluated before blocklists"},
-            )
+        if domain_blocking_on and webfilter_on and not domain_is_allowed:
+            if domain_matches(context.domain, hard_blocked_domains):
+                return Decision(False, "domain", category=context.domain, policy="common")
+            if domain_matches(context.domain, blocked_domains):
+                return Decision(False, "domain", category=context.domain, policy=",".join(policy_names))
 
-        if domain_blocking_enabled and domain_matches(context.domain, hard_blocked_domains):
-            return Decision(False, "domain", category=context.domain, policy="common")
-        if domain_blocking_enabled and domain_matches(context.domain, blocked_domains):
-            return Decision(False, "domain", category=context.domain, policy=",".join(policy_names))
-
-        bypass_content = domain_matches(context.domain, allowed_domains) and allow_bypasses
+        bypass_content = domain_is_allowed  # allowlist mag verdere scans overslaan
 
         blocked_mime = self._list_union(policies, "blocked_mime_types")
         ctype = content_type_base(context.content_type)
-        if webfilter_enabled and ctype and any(fnmatch.fnmatch(ctype, pattern.lower()) for pattern in blocked_mime):
+        if webfilter_on and ctype and any(fnmatch.fnmatch(ctype, pattern.lower()) for pattern in blocked_mime):
             return Decision(False, "mime", category=ctype, policy=",".join(policy_names))
 
         clam_result = ClamResult(status="skipped")
-        malware_enabled = any(policy.get("malware", True) for _, policy in policies)
-        if malware_enabled and body:
+        malware_policy_enabled = any(policy.get("malware", True) for _, policy in policies)
+        if antivirus_master_on and malware_policy_enabled and body:
             clam_result = self.clamav.scan(body)
             if clam_result.status == "found":
                 return Decision(False, "malware", policy=",".join(policy_names), clam=clam_result)
@@ -1062,43 +1100,68 @@ class PolicyEngine:
         if bypass_content:
             return Decision(True, "allowed_domain", policy=",".join(policy_names), clam=clam_result)
 
-        dlp_text = self._dlp_text(context, body)
-        if dlp_text:
-            dlp_enabled = any(policy.get("dlp_enabled", True) for _, policy in policies)
-            if dlp_enabled:
-                dlp_score, dlp_hits = self.dlp_engine.scan(dlp_text, context.identity.groups)
-                threshold = self._min_int(policies, "dlp_score_threshold", 50)
-                has_block_hit = any(hit.action == "block" for hit in dlp_hits)
-                if dlp_hits and has_block_hit and dlp_score >= threshold:
-                    return Decision(
-                        False,
-                        "dlp",
-                        policy=",".join(policy_names),
-                        dlp_hits=dlp_hits,
-                        clam=clam_result,
-                        details={"score": dlp_score, "threshold": threshold},
-                    )
+        # ------------------------------------------------------------------
+        # DLP: scan UITSLUITEND op POST/PUT/PATCH request body via REQMOD.
+        # DLP is bedoeld voor data die de gebruiker zelf VERSTUURT
+        # (formulier, upload, POST body). Het mag dus NIET blokkeren omdat
+        # gevoelige tekst in een URL of op een gewone webpagina staat.
+        # Daarom kijken we hier niet naar response body of headers.
+        # ------------------------------------------------------------------
+        if dlp_master_on:
+            dlp_body_text = self._dlp_scan_text(context, body)
+            if dlp_body_text:
+                dlp_enabled = any(policy.get("dlp_enabled", True) for _, policy in policies)
+                if dlp_enabled:
+                    dlp_score, dlp_hits = self.dlp_engine.scan(dlp_body_text, context.identity.groups)
+                    threshold = self._min_int(policies, "dlp_score_threshold", 50)
+                    has_block_hit = any(hit.action == "block" for hit in dlp_hits)
+                    if dlp_hits and has_block_hit and dlp_score >= threshold:
+                        return Decision(
+                            False,
+                            "dlp",
+                            policy=",".join(policy_names),
+                            dlp_hits=dlp_hits,
+                            clam=clam_result,
+                            details={"score": dlp_score, "threshold": threshold},
+                        )
 
-        scan_text = self._scan_text(context, body) if webfilter_enabled else ""
-        if scan_text and bool(self.config.get("phrase_lists", {}).get("enabled", False)):
-            phrase_scores, phrase_hits = self.phrase_engine.scan(scan_text)
-            phrase_decision = self._phrase_decision(policies, phrase_scores, phrase_hits)
-            if phrase_decision:
-                phrase_decision.policy = ",".join(policy_names)
-                phrase_decision.clam = clam_result
-                return phrase_decision
+        # Webfilter phrase scoring (los van DLP). Alleen actief als
+        # weighted_phrases globaal aan staat.
+        if webfilter_on and weighted_phrases_on:
+            scan_text = self._webfilter_scan_text(context, body)
+            if scan_text:
+                phrase_scores, phrase_hits = self.phrase_engine.scan(scan_text)
+                phrase_decision = self._phrase_decision(policies, phrase_scores, phrase_hits)
+                if phrase_decision:
+                    phrase_decision.policy = ",".join(policy_names)
+                    phrase_decision.clam = clam_result
+                    return phrase_decision
 
         return Decision(True, "clean", policy=",".join(policy_names), clam=clam_result)
 
-    def _dlp_text(self, context: ScanContext, body: bytes) -> str:
-        if context.direction != "reqmod" or context.method.upper() != "POST":
+    def _dlp_scan_text(self, context: ScanContext, body: bytes) -> str:
+        """
+        Geef de tekst terug die DLP mag bekijken.
+
+        DLP is per definitie alleen geldig op data die de client VERSTUURT.
+        Dus: enkel REQMOD, enkel methodes met een body (POST/PUT/PATCH),
+        en enkel het body-gedeelte. Geen URL, geen response, geen headers.
+        """
+        if context.direction.lower() != "reqmod":
             return ""
-        if not body or not looks_textual(context.content_type, body):
+        method = (context.method or "").upper()
+        if method not in {"POST", "PUT", "PATCH"}:
+            return ""
+        if not body:
+            return ""
+        if not looks_textual(context.content_type, body):
             return ""
         text_limit = int(self.config.get("scan", {}).get("text_scan_bytes", DEFAULT_TEXT_SCAN_BYTES))
         return decode_body_for_scan(context.content_type, body, text_limit)
 
-    def _scan_text(self, context: ScanContext, body: bytes) -> str:
+    def _webfilter_scan_text(self, context: ScanContext, body: bytes) -> str:
+        """Tekstbron voor webfilter/phrase scoring. Dit mag URL, request en
+        response data combineren - dit is content filtering, geen DLP."""
         parts = [context.url, context.domain, context.request_start, context.response_start]
         for name, values in context.http_headers.items():
             if name in {"authorization", "cookie", "set-cookie"}:
@@ -1204,6 +1267,17 @@ class ConfigStore:
         return self.config_dir / "phrases"
 
     def ensure_defaults(self) -> None:
+        """
+        Zorg dat config/users/dlp bestaan en dat elke categorie een MAP
+        heeft onder ``config/phrases/``. We maken bewust GEEN actieve
+        phraselists meer aan. De mappen worden behouden zodat de beheerder
+        later zelf eigen phrase lists kan droppen in de juiste folder.
+
+        Bestaande default-bestanden (english.weightedphraselist /
+        dutch.weightedphraselist met onze auto-generated seeds) worden bij
+        upgrade veilig hernoemd naar ``.disabled`` zodat ze niet meer geladen
+        worden door de PhraseEngine, maar de data blijft op disk als backup.
+        """
         self.config_dir.mkdir(parents=True, exist_ok=True)
         self.phrase_root.mkdir(parents=True, exist_ok=True)
         if not self.config_path.exists():
@@ -1214,34 +1288,48 @@ class ConfigStore:
             atomic_text_write(self.users_path, safe_json(default_users()) + "\n")
         if not self.dlp_path.exists():
             atomic_text_write(self.dlp_path, safe_json(default_dlp_rules()) + "\n")
-        # Maak voor ELKE E2Guardian-categorie standaard zowel Engelse als Nederlandse
-        # weighted phrase lists aan. Dit behoudt alle categorieën in de catalogus en
-        # zorgt dat de webfiltering direct bruikbaar is na --init. Bestaande files
-        # worden nooit overschreven, zodat lokale aanpassingen behouden blijven.
-        self._disable_generated_phrase_seeds()
         for entry in E2G_CATEGORY_CATALOG:
             key = entry["key"]
-            (self.phrase_root / key).mkdir(parents=True, exist_ok=True)
+            category_dir = self.phrase_root / key
+            category_dir.mkdir(parents=True, exist_ok=True)
+            for name in ("english.weightedphraselist", "dutch.weightedphraselist"):
+                target = category_dir / name
+                if target.exists():
+                    self._maybe_disable_legacy_default(target)
 
-    def _disable_generated_phrase_seeds(self) -> None:
-        for path in self.phrase_root.rglob("*.weightedphraselist"):
-            if path.name not in {"english.weightedphraselist", "dutch.weightedphraselist"}:
-                continue
-            try:
-                text = read_text(path)
-            except OSError:
-                continue
-            if "Auto-generated default" not in text:
-                continue
-            target = path.with_name(path.name + ".disabled")
-            if target.exists():
-                continue
-            path.replace(target)
+    def _maybe_disable_legacy_default(self, path: pathlib.Path) -> None:
+        """
+        Hernoem oude auto-generated weighted phrase lists naar .disabled.
+
+        We herkennen ze aan de typische marker-zinnen die door eerdere
+        versies werden geschreven. Eigen lijsten van de gebruiker worden
+        NOOIT aangeraakt. We doen dit hoogstens 1 keer per file.
+        """
+        try:
+            head = path.read_text(encoding="utf-8", errors="replace").splitlines()[:6]
+        except OSError:
+            return
+        snippet = "\n".join(head).lower()
+        markers = (
+            "auto-generated default",
+            "auto-generated default english",
+            "auto-generated default dutch",
+        )
+        if not any(marker in snippet for marker in markers):
+            return  # geen legacy file, niets doen
+        disabled = path.with_suffix(path.suffix + ".disabled")
+        try:
+            if disabled.exists():
+                disabled = path.with_name(path.name + "." + _dt.datetime.now().strftime("%Y%m%d-%H%M%S") + ".disabled")
+            os.replace(path, disabled)
+            logging.info("Disabled legacy phrase file: %s -> %s", path, disabled.name)
+        except OSError as exc:
+            logging.warning("Could not disable legacy phrase file %s: %s", path, exc)
 
     def reload(self) -> None:
         with self.lock:
             user_config = json.loads(read_text(self.config_path))
-            self.config = normalize_phrase_policy_defaults(deep_merge(default_config(), user_config))
+            self.config = deep_merge(default_config(), user_config)
             self.users = json.loads(read_text(self.users_path))
             self.dlp = json.loads(read_text(self.dlp_path))
             self.phrase_engine = PhraseEngine(self.phrase_root, self.config.get("phrase_lists", {}))
@@ -1335,7 +1423,7 @@ class ConfigStore:
             self.reload()
 
     def save_config_data(self, data: dict[str, Any]) -> None:
-        self._save_json_path(self.config_path, normalize_phrase_policy_defaults(data))
+        self._save_json_path(self.config_path, data)
 
     def save_users_data(self, data: dict[str, Any]) -> None:
         self._save_json_path(self.users_path, data)
@@ -1368,9 +1456,6 @@ class ConfigStore:
 
     def status(self) -> dict[str, Any]:
         with self.lock:
-            common = self.config.get("common_policy", {})
-            phrase_cfg = self.config.get("phrase_lists", {})
-            identity_cfg = self.config.get("identity", {})
             return {
                 "app": APP_NAME,
                 "version": APP_VERSION,
@@ -1384,25 +1469,6 @@ class ConfigStore:
                     "port": self.config.get("server", {}).get("dashboard_port"),
                 },
                 "clamav": self.config.get("clamav", {}),
-                "logging": self.config.get("logging", {"enabled": True}),
-                "features": {
-                    "webfiltering_enabled": bool(common.get("webfiltering_enabled", True)),
-                    "domain_blocking_enabled": bool(common.get("domain_blocking_enabled", True)),
-                    "weighted_phrases_enabled": bool(phrase_cfg.get("enabled", False)),
-                    "dlp_enabled": bool(common.get("dlp_enabled", True)),
-                    "antivirus_enabled": bool(self.config.get("clamav", {}).get("enabled", True)),
-                    "logging_enabled": bool(self.config.get("logging", {}).get("enabled", True)),
-                    "netbird_sync_enabled": bool(identity_cfg.get("netbird_sync_enabled", False)),
-                    "allow_domains_bypass_content": bool(common.get("allow_domains_bypass_content", False)),
-                    "clamav_fail_open": bool(self.config.get("clamav", {}).get("fail_open", False)),
-                    "dlp_fail_open": bool(common.get("dlp_fail_open", False)),
-                    "webfilter_fail_open": bool(common.get("webfilter_fail_open", False)),
-                },
-                "todos": {
-                    "netbird_sync_trigger": "backend hook aanwezig in UI, externe scheduler/script blijft verantwoordelijk",
-                    "entra_id_sync": "backend hook gereserveerd voor latere Entra-ID integratie",
-                    "service_restart": "bewust geen systemctl-acties vanuit dashboard zonder extra beveiliging",
-                },
                 "phrase_rules": len(self.phrase_engine.rules if self.phrase_engine else []),
                 "phrase_categories": sorted(self.phrase_category_counts()),
                 "phrase_errors": self.phrase_engine.load_errors if self.phrase_engine else [],
@@ -1558,6 +1624,11 @@ class ICAPHandler(socketserver.StreamRequestHandler):
         decision = store.policy_engine.evaluate(context, message.body)
         self._log_decision(message, context, decision)
         if decision.allowed:
+            # Belangrijk voor RESPMOD: bij toegelaten verkeer moet de ICAP-server
+            # de response niet opnieuw opbouwen. Dat is foutgevoelig bij chunked,
+            # gecomprimeerde of grote responses. Squid ondersteunt 204 en krijgt
+            # dan gewoon de originele server-response terug. Dit voorkomt
+            # "ICAP connection error" tijdens normaal surfen.
             if "204" in header_get(message.headers, "allow"):
                 self._send_no_adaptation()
             else:
@@ -1579,10 +1650,15 @@ class ICAPHandler(socketserver.StreamRequestHandler):
             content_type = header_get(message.res.headers, "content-type")
             request_start = message.req.start_line
             response_start = message.res.start_line
-        http_method = (request_start.split() or [""])[0].upper()
         resolver = self.server.store.identity_resolver
         assert resolver is not None
         identity = resolver.resolve(message.headers, http_headers)
+        # context.method moet de echte HTTP-methode zijn (GET/POST/PUT/...),
+        # niet de ICAP-methode (REQMOD/RESPMOD). Anders werkt DLP op POST body
+        # niet correct en kunnen policies fout evalueren.
+        http_method = ""
+        if request_start:
+            http_method = request_start.split(" ", 1)[0].upper()
         return ScanContext(
             direction=message.method.lower(),
             url=url,
@@ -1646,13 +1722,25 @@ class ICAPHandler(socketserver.StreamRequestHandler):
         else:
             req = message.req.raw_header
             res = message.res.raw_header
-            res_offset = len(req)
-            if message.body:
-                encapsulated = f"req-hdr=0, res-hdr={res_offset}, res-body={res_offset + len(res)}"
+            # Sommige Squid RESPMOD-aanvragen bevatten geen req-hdr. De oude code
+            # stuurde dan toch "req-hdr=0, res-hdr=0", wat een ongeldig/ambigu
+            # Encapsulated-header oplevert en bij Squid als ICAP connection error
+            # kan eindigen. Bouw de Encapsulated-header daarom conditioneel op.
+            if req:
+                res_offset = len(req)
+                if message.body:
+                    encapsulated = f"req-hdr=0, res-hdr={res_offset}, res-body={res_offset + len(res)}"
+                else:
+                    encapsulated = f"req-hdr=0, res-hdr={res_offset}, null-body={res_offset + len(res)}"
+                payload = req + res
             else:
-                encapsulated = f"req-hdr=0, res-hdr={res_offset}, null-body={res_offset + len(res)}"
+                if message.body:
+                    encapsulated = f"res-hdr=0, res-body={len(res)}"
+                else:
+                    encapsulated = f"res-hdr=0, null-body={len(res)}"
+                payload = res
             headers = self._icap_200_headers(encapsulated)
-            self.wfile.write(headers + req + res)
+            self.wfile.write(headers + payload)
             if message.body:
                 self._write_chunk(message.body)
                 self._write_chunk(b"")
@@ -1719,13 +1807,10 @@ class ICAPHandler(socketserver.StreamRequestHandler):
         return _dt.datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S GMT")
 
     def _log_decision(self, message: ICAPMessage, context: ScanContext, decision: Decision) -> None:
-        if not bool(self.server.store.config.get("logging", {}).get("enabled", True)):
-            return
         event = {
             "incident_id": decision.incident_id,
             "action": "allow" if decision.allowed else "block",
             "reason": decision.reason,
-            "category": decision.category,
             "public_reason": decision.public_reason(),
             "policy": decision.policy,
             "method": message.method,
@@ -2084,28 +2169,6 @@ def dashboard_policy_snapshot(store: ConfigStore, events: EventLogger) -> dict[s
                 domain_rows.append({"target": group, "label": group, "list": list_name, "domain": domain})
 
     event_snapshot = events.snapshot()
-    recent_events = event_snapshot.get("recent", [])
-    user_activity: dict[str, dict[str, int]] = {}
-    domain_activity: collections.Counter[str] = collections.Counter()
-    category_blocks: collections.Counter[str] = collections.Counter()
-    traffic_by_hour: collections.Counter[str] = collections.Counter()
-    blocks_by_hour: collections.Counter[str] = collections.Counter()
-    for event in recent_events:
-        action = str(event.get("action", "unknown"))
-        user = str(event.get("user") or "anonymous")
-        domain = str(event.get("domain") or "")
-        reason = str(event.get("reason") or "")
-        category = str(event.get("category") or event.get("details", {}).get("category") or reason)
-        bucket = str(event.get("ts") or "")[:13] or "unknown"
-        traffic_by_hour[bucket] += 1
-        user_activity.setdefault(user, {"allow": 0, "block": 0, "total": 0})
-        user_activity[user]["total"] += 1
-        user_activity[user][action] = user_activity[user].get(action, 0) + 1
-        if domain and action == "block":
-            domain_activity[domain] += 1
-        if action == "block":
-            blocks_by_hour[bucket] += 1
-            category_blocks[category] += 1
     public_dlp = {"rules": []}
     for rule in store.dlp.get("rules", []):
         public_dlp["rules"].append({key: value for key, value in rule.items() if not key.startswith("_")})
@@ -2123,19 +2186,8 @@ def dashboard_policy_snapshot(store: ConfigStore, events: EventLogger) -> dict[s
                 if value is not None
             ),
             "blocked_domains": sum(1 for row in domain_rows if row["list"] in {"blocked_domains", "hard_blocked_domains"}),
-            "allowed_domains": sum(1 for row in domain_rows if row["list"] == "allowed_domains"),
-            "phrase_rules": sum(counts.values()) if config.get("phrase_lists", {}).get("enabled", False) else 0,
             "dlp_rules": len(store.dlp.get("rules", [])),
             "events": event_snapshot.get("stats", {}).get("total", 0),
-        },
-        "analytics": {
-            "allowed": event_snapshot.get("stats", {}).get("allow", 0),
-            "blocked": event_snapshot.get("stats", {}).get("block", 0),
-            "traffic_by_hour": dict(sorted(traffic_by_hour.items())),
-            "blocks_by_hour": dict(sorted(blocks_by_hour.items())),
-            "top_blocked_domains": domain_activity.most_common(10),
-            "top_blocked_categories": category_blocks.most_common(10),
-            "top_users": sorted(user_activity.items(), key=lambda item: item[1].get("total", 0), reverse=True)[:10],
         },
         "groups": groups,
         "policies": {
@@ -2198,10 +2250,16 @@ def dashboard_update_group(store: ConfigStore, data: dict[str, Any]) -> dict[str
     policies = config.setdefault("policies", {})
     action = str(data.get("action", "add")).lower()
     if action == "delete":
+        # Geen vaste basisgroepen meer; alle groepen mogen verwijderd
+        # worden. NetBird sync zal ze opnieuw aanmaken als de groep
+        # nog bestaat in NetBird.
         policies.pop(group, None)
     else:
-        template = slugify_key(str(data.get("copy_from", "all")))
-        base = policies.get(template) or config.get("common_policy", {})
+        template = slugify_key(str(data.get("copy_from", "")) or "common")
+        if template == "common":
+            base = config.get("common_policy", {})
+        else:
+            base = policies.get(template) or config.get("common_policy", {}) or {}
         policies.setdefault(group, json.loads(json.dumps(base)))
     store.save_config_data(config)
     return {"ok": True, "group": group, "action": action}
@@ -2214,7 +2272,7 @@ def dashboard_update_user(store: ConfigStore, data: dict[str, Any]) -> dict[str,
     action = str(data.get("action", "save")).lower()
     username = str(data.get("user", "")).strip().lower()
     ip_value = str(data.get("ip", "")).strip()
-    groups = split_groups(data.get("groups", "default"))
+    groups = split_groups(data.get("groups", ""))
     if action == "delete":
         if username:
             users["users"].pop(username, None)
@@ -2252,37 +2310,448 @@ def dashboard_update_dlp(store: ConfigStore, data: dict[str, Any]) -> dict[str, 
     return {"ok": True, "index": index, "action": action}
 
 
-def dashboard_update_setting(store: ConfigStore, data: dict[str, Any]) -> dict[str, Any]:
-    config = editable_config(store)
-    key = str(data.get("key", "")).strip()
-    enabled = parse_bool(str(data.get("enabled", "true")), True)
-    common = config.setdefault("common_policy", {})
-    mapping = {
-        "webfiltering_enabled": ("common_policy", "webfiltering_enabled"),
-        "domain_blocking_enabled": ("common_policy", "domain_blocking_enabled"),
-        "dlp_enabled": ("common_policy", "dlp_enabled"),
-        "allow_domains_bypass_content": ("common_policy", "allow_domains_bypass_content"),
-        "dlp_fail_open": ("common_policy", "dlp_fail_open"),
-        "webfilter_fail_open": ("common_policy", "webfilter_fail_open"),
-        "weighted_phrases_enabled": ("phrase_lists", "enabled"),
-        "antivirus_enabled": ("clamav", "enabled"),
-        "clamav_fail_open": ("clamav", "fail_open"),
-        "logging_enabled": ("logging", "enabled"),
-        "netbird_sync_enabled": ("identity", "netbird_sync_enabled"),
+# Toegelaten master-toggles voor /api/settings.
+KNOWN_SETTINGS: tuple[str, ...] = (
+    "webfilter_enabled",
+    "domain_blocking_enabled",
+    "weighted_phrases_enabled",
+    "dlp_enabled",
+    "antivirus_enabled",
+    "logging_enabled",
+    "netbird_sync_enabled",
+)
+
+
+def dashboard_get_settings(store: ConfigStore) -> dict[str, Any]:
+    settings = dict(store.config.get("settings", {}) or {})
+    clamav = dict(store.config.get("clamav", {}) or {})
+    common = dict(store.config.get("common_policy", {}) or {})
+    return {
+        "settings": {key: bool(settings.get(key, True)) for key in KNOWN_SETTINGS},
+        "clamav_fail_open": bool(clamav.get("fail_open", False)),
+        "allow_domains_bypass_content": bool(common.get("allow_domains_bypass_content", True)),
     }
-    if key not in mapping:
-        raise ValueError("onbekende instelling")
-    section, config_key = mapping[key]
-    target = config.setdefault(section, {})
-    target[config_key] = enabled
-    if key == "weighted_phrases_enabled" and not enabled:
-        common["phrase_thresholds"] = {}
-        common["phrase_total_threshold"] = 0
-        for policy in config.setdefault("policies", {}).values():
-            policy["phrase_thresholds"] = {}
-            policy["phrase_total_threshold"] = 0
+
+
+def dashboard_update_settings(store: ConfigStore, data: dict[str, Any]) -> dict[str, Any]:
+    config = editable_config(store)
+    settings = config.setdefault("settings", {})
+    for key in KNOWN_SETTINGS:
+        if key in data:
+            settings[key] = parse_bool(str(data[key]), True)
+    if "clamav_fail_open" in data:
+        config.setdefault("clamav", {})["fail_open"] = parse_bool(str(data["clamav_fail_open"]), False)
+    if "allow_domains_bypass_content" in data:
+        config.setdefault("common_policy", {})["allow_domains_bypass_content"] = parse_bool(
+            str(data["allow_domains_bypass_content"]), True
+        )
     store.save_config_data(config)
-    return {"ok": True, "key": key, "enabled": enabled}
+    return dashboard_get_settings(store)
+
+
+def _parse_ts(value: str) -> float:
+    if not value:
+        return 0.0
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return _dt.datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def filter_events(
+    events: list[dict[str, Any]],
+    *,
+    user: str = "",
+    ip: str = "",
+    domain: str = "",
+    category: str = "",
+    action: str = "",
+    status: str = "",
+    incident_id: str = "",
+    q: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    """Server-side filter helper voor de logspagina."""
+    user_l = user.strip().lower()
+    ip_l = ip.strip().lower()
+    domain_l = domain.strip().lower()
+    category_l = category.strip().lower()
+    action_l = action.strip().lower()
+    status_l = status.strip().lower()
+    incident_l = incident_id.strip().lower()
+    q_l = q.strip().lower()
+    ts_from = _parse_ts(date_from) if date_from else 0.0
+    ts_to = _parse_ts(date_to) if date_to else 0.0
+
+    out: list[dict[str, Any]] = []
+    for event in reversed(events):  # nieuwste eerst
+        if user_l and user_l not in str(event.get("user", "")).lower():
+            continue
+        if ip_l and ip_l not in str(event.get("source_ip", "")).lower():
+            continue
+        if domain_l:
+            haystack = (str(event.get("domain", "")) + " " + str(event.get("url", ""))).lower()
+            if domain_l not in haystack:
+                continue
+        if category_l:
+            cat_match = category_l in str(event.get("details", {}).get("category", "")).lower() or \
+                category_l in str(event.get("reason", "")).lower()
+            for hit in event.get("phrase_hits", []) or []:
+                if category_l in str(hit.get("category", "")).lower():
+                    cat_match = True
+                    break
+            if not cat_match:
+                continue
+        if action_l and action_l != str(event.get("action", "")).lower():
+            continue
+        if status_l and status_l != str(event.get("reason", "")).lower():
+            continue
+        if incident_l and incident_l not in str(event.get("incident_id", "")).lower():
+            continue
+        if q_l:
+            blob = json.dumps(event, ensure_ascii=False).lower()
+            if q_l not in blob:
+                continue
+        if ts_from or ts_to:
+            ts_value = _parse_ts(str(event.get("ts", "")))
+            if ts_from and ts_value < ts_from:
+                continue
+            if ts_to and ts_value > ts_to:
+                continue
+        out.append(event)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def dashboard_logs_payload(store: ConfigStore, events: EventLogger, params: dict[str, list[str]]) -> dict[str, Any]:
+    def first(name: str, default: str = "") -> str:
+        return params.get(name, [default])[0]
+
+    all_events = events.all_events()
+    limit_raw = first("limit", "500")
+    try:
+        limit = max(1, min(5000, int(limit_raw)))
+    except ValueError:
+        limit = 500
+    filtered = filter_events(
+        all_events,
+        user=first("user"),
+        ip=first("ip"),
+        domain=first("domain"),
+        category=first("category"),
+        action=first("action"),
+        status=first("status"),
+        incident_id=first("incident_id"),
+        q=first("q"),
+        date_from=first("from"),
+        date_to=first("to"),
+        limit=limit,
+    )
+    return {
+        "events": filtered,
+        "total_on_disk": len(all_events),
+        "filtered_count": len(filtered),
+        "log_path": str(events.path),
+    }
+
+
+def dashboard_event_detail(events: EventLogger, incident_id: str) -> dict[str, Any]:
+    incident_id = (incident_id or "").strip().lower()
+    if not incident_id:
+        raise ValueError("incident_id is verplicht")
+    for event in events.all_events():
+        if str(event.get("incident_id", "")).lower() == incident_id:
+            return event
+    raise ValueError("event niet gevonden")
+
+
+def dashboard_user_detail(store: ConfigStore, events: EventLogger, user_id: str) -> dict[str, Any]:
+    user_id = (user_id or "").strip().lower()
+    users = store.users.get("users", {})
+    user_obj = users.get(user_id) or users.get(user_id.lower()) or {}
+    ip_entries: list[dict[str, Any]] = []
+    for ip, mapping in (store.users.get("ip_map", {}) or {}).items():
+        mapped_user = mapping.get("user") if isinstance(mapping, dict) else mapping
+        if str(mapped_user or "").lower() == user_id:
+            ip_entries.append({"ip": ip, "groups": (mapping.get("groups") if isinstance(mapping, dict) else []) or []})
+
+    groups = list(user_obj.get("groups", []) or [])
+    if not groups:
+        for entry in ip_entries:
+            groups.extend(entry.get("groups", []))
+    groups = sorted({g for g in groups if g})
+
+    user_events = [event for event in events.all_events() if str(event.get("user", "")).lower() == user_id]
+    user_events.sort(key=lambda e: _parse_ts(str(e.get("ts", ""))), reverse=True)
+    allowed = sum(1 for e in user_events if e.get("action") == "allow")
+    blocked = sum(1 for e in user_events if e.get("action") == "block")
+    reason_counter: collections.Counter[str] = collections.Counter()
+    domain_counter: collections.Counter[str] = collections.Counter()
+    category_counter: collections.Counter[str] = collections.Counter()
+    for event in user_events:
+        if event.get("action") == "block":
+            reason_counter[str(event.get("reason", "unknown"))] += 1
+            domain_counter[str(event.get("domain", "?"))] += 1
+            cat = event.get("details", {}).get("category") or event.get("reason", "")
+            category_counter[str(cat or "?")] += 1
+
+    config_policies = store.config.get("policies", {}) or {}
+    matched_policies = {group: config_policies.get(group, {}) for group in groups if group in config_policies}
+
+    return {
+        "user": user_id,
+        "name": user_obj.get("name", ""),
+        "email": user_id if "@" in user_id else "",
+        "groups": groups,
+        "entra_object_id": user_obj.get("entra_object_id", ""),
+        "entra_groups": user_obj.get("entra_groups", []) or [],
+        "netbird_user_id": user_obj.get("netbird_user_id", ""),
+        "netbird_peer_ids": user_obj.get("netbird_peer_ids", []) or [],
+        "netbird_hostnames": user_obj.get("netbird_hostnames", []) or [],
+        "ips": ip_entries,
+        "policies": matched_policies,
+        "stats": {
+            "total": len(user_events),
+            "allowed": allowed,
+            "blocked": blocked,
+            "top_block_reasons": reason_counter.most_common(10),
+            "top_blocked_domains": domain_counter.most_common(10),
+            "top_blocked_categories": category_counter.most_common(10),
+        },
+        "recent_events": user_events[:50],
+    }
+
+
+def dashboard_services_status(store: ConfigStore, events: EventLogger) -> dict[str, Any]:
+    settings = store.config.get("settings", {}) or {}
+    icap_cfg = store.config.get("server", {}) or {}
+    clam_cfg = store.config.get("clamav", {}) or {}
+    snapshot = events.snapshot()
+    users_meta = (store.users.get("meta", {}) or {}) if isinstance(store.users, dict) else {}
+    last_sync_unix = users_meta.get("synced_at_unix")
+    last_sync_iso = ""
+    if isinstance(last_sync_unix, (int, float)) and last_sync_unix > 0:
+        last_sync_iso = _dt.datetime.fromtimestamp(last_sync_unix, tz=_dt.timezone.utc).isoformat(timespec="seconds")
+    icap_status = "running"
+    try:
+        with socket.create_connection((str(icap_cfg.get("icap_host") or "127.0.0.1"), int(icap_cfg.get("icap_port") or 13440)), timeout=1):
+            icap_status = "running"
+    except OSError:
+        icap_status = "unreachable"
+
+    clam_status = "disabled"
+    if settings.get("antivirus_enabled", True) and clam_cfg.get("enabled", True):
+        try:
+            if clam_cfg.get("unix_socket"):
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock.settimeout(1)
+                sock.connect(str(clam_cfg["unix_socket"]))
+                sock.sendall(b"PING\0")
+                pong = sock.recv(16)
+                sock.close()
+                clam_status = "running" if pong.startswith(b"PONG") else "error"
+            else:
+                with socket.create_connection((str(clam_cfg.get("host", "127.0.0.1")), int(clam_cfg.get("port", 3310))), timeout=1) as sock:
+                    sock.sendall(b"zPING\0")
+                    pong = sock.recv(16)
+                    clam_status = "running" if pong.startswith(b"PONG") else "error"
+        except OSError:
+            clam_status = "unreachable"
+
+    return {
+        "services": [
+            {
+                "key": "icap",
+                "label": "ICAP service",
+                "status": icap_status,
+                "detail": f"{icap_cfg.get('icap_host')}:{icap_cfg.get('icap_port')}",
+            },
+            {
+                "key": "webfilter",
+                "label": "Web filter",
+                "status": "running" if settings.get("webfilter_enabled", True) else "disabled",
+                "detail": "Content filtering en domeinblokkering",
+            },
+            {
+                "key": "domain_blocking",
+                "label": "Domain blocking",
+                "status": "running" if settings.get("domain_blocking_enabled", True) else "disabled",
+                "detail": "Block/allowlist + UT1",
+            },
+            {
+                "key": "phrases",
+                "label": "Weighted phrases",
+                "status": "running" if settings.get("weighted_phrases_enabled", False) else "disabled",
+                "detail": f"{len(store.phrase_engine.rules) if store.phrase_engine else 0} actieve regels",
+            },
+            {
+                "key": "dlp",
+                "label": "DLP",
+                "status": "running" if settings.get("dlp_enabled", True) else "disabled",
+                "detail": f"{len(store.dlp.get('rules', []))} DLP regels",
+            },
+            {
+                "key": "antivirus",
+                "label": "Antivirus / ClamAV",
+                "status": clam_status,
+                "detail": clam_cfg.get("unix_socket") or f"{clam_cfg.get('host')}:{clam_cfg.get('port')}",
+            },
+            {
+                "key": "logging",
+                "label": "Logging",
+                "status": "running" if settings.get("logging_enabled", True) else "disabled",
+                "detail": f"{snapshot['stats'].get('total', 0)} events totaal",
+            },
+            {
+                "key": "netbird",
+                "label": "NetBird sync",
+                "status": "running" if settings.get("netbird_sync_enabled", True) else "disabled",
+                "detail": f"Laatste sync: {last_sync_iso or 'onbekend'}",
+            },
+            {
+                "key": "config",
+                "label": "Config",
+                "status": "running",
+                "detail": f"Versie {store.version}",
+            },
+        ],
+        "last_sync_iso": last_sync_iso,
+        "phrase_load_errors": list(store.phrase_engine.load_errors) if store.phrase_engine else [],
+        "dlp_load_errors": list(store.dlp_engine.errors) if store.dlp_engine else [],
+        "event_load_errors": snapshot.get("load_errors", []),
+    }
+
+
+def dashboard_charts_data(store: ConfigStore, events: EventLogger) -> dict[str, Any]:
+    """Aggregeer recent events tot grafiek-data voor de homepage."""
+    all_events = events.all_events()
+    if not all_events:
+        return {
+            "totals": {"allow": 0, "block": 0},
+            "hourly": [],
+            "daily": [],
+            "top_categories": [],
+            "top_users": [],
+            "top_domains": [],
+        }
+    now = _dt.datetime.now(_dt.timezone.utc)
+    hour_buckets: dict[str, dict[str, int]] = {}
+    day_buckets: dict[str, dict[str, int]] = {}
+    cat_counter: collections.Counter[str] = collections.Counter()
+    user_counter: collections.Counter[str] = collections.Counter()
+    domain_counter: collections.Counter[str] = collections.Counter()
+    allow_count = 0
+    block_count = 0
+    for event in all_events:
+        ts = _parse_ts(str(event.get("ts", "")))
+        if not ts:
+            continue
+        moment = _dt.datetime.fromtimestamp(ts, tz=_dt.timezone.utc)
+        action = event.get("action", "unknown")
+        if action == "allow":
+            allow_count += 1
+        elif action == "block":
+            block_count += 1
+        if (now - moment).total_seconds() <= 24 * 3600:
+            hkey = moment.strftime("%Y-%m-%d %H:00")
+            slot = hour_buckets.setdefault(hkey, {"allow": 0, "block": 0})
+            slot[action] = slot.get(action, 0) + 1
+        if (now - moment).total_seconds() <= 30 * 24 * 3600:
+            dkey = moment.strftime("%Y-%m-%d")
+            slot = day_buckets.setdefault(dkey, {"allow": 0, "block": 0})
+            slot[action] = slot.get(action, 0) + 1
+        if action == "block":
+            cat = str(event.get("details", {}).get("category") or event.get("reason") or "onbekend")
+            cat_counter[cat] += 1
+            user_counter[str(event.get("user", "anoniem"))] += 1
+            domain_counter[str(event.get("domain", "?"))] += 1
+
+    hourly = [
+        {"bucket": key, "allow": value.get("allow", 0), "block": value.get("block", 0)}
+        for key, value in sorted(hour_buckets.items())
+    ]
+    daily = [
+        {"bucket": key, "allow": value.get("allow", 0), "block": value.get("block", 0)}
+        for key, value in sorted(day_buckets.items())
+    ]
+    return {
+        "totals": {"allow": allow_count, "block": block_count},
+        "hourly": hourly,
+        "daily": daily,
+        "top_categories": cat_counter.most_common(10),
+        "top_users": user_counter.most_common(10),
+        "top_domains": domain_counter.most_common(10),
+    }
+
+
+def dashboard_home_summary(store: ConfigStore, events: EventLogger) -> dict[str, Any]:
+    base = dashboard_policy_snapshot(store, events)
+    settings = store.config.get("settings", {}) or {}
+    services = dashboard_services_status(store, events)
+    charts = dashboard_charts_data(store, events)
+    snapshot = base["events"]
+    base["summary"]["weighted_phrases_enabled"] = bool(settings.get("weighted_phrases_enabled", False))
+    base["summary"]["phrases_rules"] = len(store.phrase_engine.rules) if store.phrase_engine else 0
+    base["summary"]["weighted_phrases"] = base["summary"]["phrases_rules"] if settings.get("weighted_phrases_enabled", False) else 0
+    base["summary"]["block_events"] = snapshot.get("stats", {}).get("block", 0)
+    base["summary"]["allow_events"] = snapshot.get("stats", {}).get("allow", 0)
+    base["summary"]["events_total"] = snapshot.get("stats", {}).get("total", 0)
+    base["settings"] = {key: bool(settings.get(key, True)) for key in KNOWN_SETTINGS}
+    base["services"] = services["services"]
+    base["last_sync_iso"] = services["last_sync_iso"]
+    base["charts"] = charts
+    base["recent_events"] = snapshot.get("recent", [])[:25]
+    base["recent_blocks"] = [event for event in snapshot.get("recent", []) if event.get("action") == "block"][:10]
+    return base
+
+
+def trigger_netbird_sync() -> dict[str, Any]:
+    """
+    Veilige hook om NetBird sync vanaf het dashboard te triggeren.
+
+    We schakelen alleen door naar het systeem als er een omgevings-flag
+    ``SCHOOL_ICAP_NETBIRD_SYNC_CMD`` aanwezig is. Anders rapporteren we
+    501 zodat de UI weet dat de backend de actie niet uitvoert. Dit
+    voorkomt dat het dashboard zonder beveiliging systemctl-commands kan
+    uitvoeren.
+    """
+    cmd = os.environ.get("SCHOOL_ICAP_NETBIRD_SYNC_CMD", "").strip()
+    if not cmd:
+        return {
+            "ok": False,
+            "status": 501,
+            "message": (
+                "NetBird sync trigger is niet geconfigureerd. Zet "
+                "SCHOOL_ICAP_NETBIRD_SYNC_CMD in de service-omgeving "
+                "naar bv. 'systemctl start netbird-users-sync.service' "
+                "om dit veilig te activeren."
+            ),
+        }
+    import shlex
+    import subprocess
+    try:
+        completed = subprocess.run(
+            shlex.split(cmd),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        return {
+            "ok": completed.returncode == 0,
+            "status": 200 if completed.returncode == 0 else 500,
+            "returncode": completed.returncode,
+            "stdout": completed.stdout[-2000:],
+            "stderr": completed.stderr[-2000:],
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "status": 500, "message": str(exc)}
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -2300,14 +2769,30 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if not self._authenticated(parsed):
                 self._redirect("/login")
                 return
-            if parsed.path == "/":
-                self._send_html(render_modern_dashboard())
+            if parsed.path in ("/", "/home", "/users", "/policies", "/domains", "/categories",
+                               "/phrases", "/dlp", "/services", "/logs", "/settings", "/test", "/files"):
+                self._send_html(render_dashboard_app())
             elif parsed.path == "/api/status":
                 self._send_json(self.server.store.status())
             elif parsed.path == "/api/events":
                 self._send_json(self.server.events.snapshot())
             elif parsed.path == "/api/policy":
                 self._send_json(dashboard_policy_snapshot(self.server.store, self.server.events))
+            elif parsed.path == "/api/home":
+                self._send_json(dashboard_home_summary(self.server.store, self.server.events))
+            elif parsed.path == "/api/services":
+                self._send_json(dashboard_services_status(self.server.store, self.server.events))
+            elif parsed.path == "/api/settings":
+                self._send_json(dashboard_get_settings(self.server.store))
+            elif parsed.path == "/api/logs":
+                params = urllib.parse.parse_qs(parsed.query)
+                self._send_json(dashboard_logs_payload(self.server.store, self.server.events, params))
+            elif parsed.path == "/api/event":
+                params = urllib.parse.parse_qs(parsed.query)
+                self._send_json(dashboard_event_detail(self.server.events, params.get("incident_id", [""])[0]))
+            elif parsed.path == "/api/user":
+                params = urllib.parse.parse_qs(parsed.query)
+                self._send_json(dashboard_user_detail(self.server.store, self.server.events, params.get("id", [""])[0]))
             elif parsed.path == "/api/files":
                 self._send_json({"files": self.server.store.list_files()})
             elif parsed.path == "/api/file":
@@ -2318,8 +2803,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 params = urllib.parse.parse_qs(parsed.query)
                 rel = params.get("path", ["config.json"])[0]
                 self._send_html(render_editor(rel, self.server.store.read_file(rel)))
-            elif parsed.path == "/test":
-                self._send_html(render_test_page())
             else:
                 self.send_error(404)
         except Exception as exc:  # noqa: BLE001
@@ -2335,7 +2818,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if self._token_ok(token):
                     self.send_response(302)
                     self.send_header("Location", "/")
-                    self.send_header("Set-Cookie", f"guard_token={urllib.parse.quote(token)}; HttpOnly; SameSite=Strict")
+                    self.send_header("Set-Cookie", f"guard_token={urllib.parse.quote(token)}; HttpOnly; SameSite=Strict; Path=/")
                     self.end_headers()
                 else:
                     self._send_html(render_login(error="Ongeldig token"), status=403)
@@ -2357,7 +2840,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/dlp/rule":
                 self._send_json(dashboard_update_dlp(self.server.store, self._read_json_body()))
             elif parsed.path == "/api/settings":
-                self._send_json(dashboard_update_setting(self.server.store, self._read_json_body()))
+                self._send_json(dashboard_update_settings(self.server.store, self._read_json_body()))
+            elif parsed.path == "/api/sync/netbird":
+                self._send_json(trigger_netbird_sync())
             elif parsed.path == "/save":
                 length = int(self.headers.get("Content-Length", "0"))
                 form = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8", errors="replace"))
@@ -2391,19 +2876,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
         identity = Identity(
             user=data.get("user", "test-user"),
             source_ip=data.get("source_ip", "127.0.0.1"),
-            groups=[g.strip() for g in data.get("groups", "default").split(",") if g.strip()],
+            groups=[g.strip() for g in data.get("groups", "student").split(",") if g.strip()],
             source="dashboard-test",
         )
         context = ScanContext(
             direction=data.get("direction", "reqmod"),
             url=data.get("url", ""),
             domain=normalize_domain(urllib.parse.urlsplit(data.get("url", "")).netloc),
-            method=data.get("http_method", "GET").upper(),
+            method=data.get("direction", "REQMOD").upper(),
             content_type=data.get("content_type", "text/plain"),
             identity=identity,
             icap_headers={},
             http_headers=headers,
-            request_start=f"{data.get('http_method', 'GET').upper()} {data.get('url', '/')} HTTP/1.1",
+            request_start=f"GET {data.get('url', '/')} HTTP/1.1",
         )
         body = data.get("body", "").encode("utf-8")
         if str(data.get("skip_clamav", "on")).lower() in {"on", "true", "1", "yes"}:
@@ -2476,837 +2961,36 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 def render_login(error: str = "") -> str:
-    error_html = f"<p class='error'>{html_lib.escape(error)}</p>" if error else ""
+    error_html = f'<p class="error">{html_lib.escape(error)}</p>' if error else ""
     return f"""<!doctype html>
-<html lang="nl">
+<html lang="nl" data-theme="auto">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>School ICAP Guard</title>
+  <title>Aanmelden | School ICAP Guard</title>
   <style>{DASHBOARD_CSS}</style>
 </head>
-<body class="centered">
-  <main class="login">
-    <h1>School ICAP Guard</h1>
+<body class="login-body">
+  <main class="login-card">
+    <div class="login-brand">
+      <div class="brand-mark">SI</div>
+      <div>
+        <h1>School ICAP Guard</h1>
+        <p>Beheerdersdashboard</p>
+      </div>
+    </div>
     {error_html}
     <form method="post" action="/login">
-      <label>Dashboard token
-        <input name="token" type="password" autofocus>
+      <label class="field">
+        <span>Dashboard token</span>
+        <input name="token" type="password" autocomplete="current-password" autofocus>
       </label>
-      <button type="submit">Aanmelden</button>
+      <button type="submit" class="primary">Aanmelden</button>
     </form>
+    <footer class="login-footer">
+      <span>Copyright &copy; 2026 Youness Banali El Khattabi</span>
+    </footer>
   </main>
-</body>
-</html>"""
-
-
-def render_admin_dashboard() -> str:
-    html = """<!doctype html>
-<html lang="nl">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>School ICAP Guard</title>
-  <style>__DASHBOARD_CSS__</style>
-</head>
-<body>
-  <header>
-    <h1>School ICAP Guard</h1>
-    <nav>
-      <a href="#categories">Categorieen</a>
-      <a href="#domains">Domeinen</a>
-      <a href="#users">Gebruikers</a>
-      <a href="/test">Test</a>
-      <a href="/edit?path=config.json">Advanced</a>
-    </nav>
-  </header>
-  <main>
-    <section class="summary-grid" id="summary"></section>
-
-    <section class="admin-grid">
-      <div class="panel wide-panel" id="categories">
-        <div class="panel-head">
-          <div>
-            <h2>Categorieen per groep</h2>
-            <p class="hint">Kies een groep, zoek een categorie in Nederlands of Engels en zet de blokkering aan. De threshold is de phrase score vanaf waar de pagina wordt geblokkeerd.</p>
-          </div>
-          <button id="reload">Reload</button>
-        </div>
-        <div class="toolbar">
-          <label>Groep
-            <select id="category-group"></select>
-          </label>
-          <label>Zoeken
-            <input id="category-search" placeholder="adult, gokken, malware, social...">
-          </label>
-        </div>
-        <div id="category-list" class="category-list"></div>
-      </div>
-
-      <div class="panel" id="domains">
-        <h2>Domein blokkeren of toelaten</h2>
-        <form id="domain-form" class="inline-form">
-          <label>Voor
-            <select name="target" id="domain-target"></select>
-          </label>
-          <label>Actie
-            <select name="list">
-              <option value="blocked_domains">Blokkeren</option>
-              <option value="hard_blocked_domains">Hard block alle groepen</option>
-              <option value="allowed_domains">Toestaan</option>
-            </select>
-          </label>
-          <label>Domein
-            <input name="domain" placeholder="example.com of *.example.com" required>
-          </label>
-          <button type="submit">Toevoegen</button>
-        </form>
-        <div id="domain-list" class="list-stack"></div>
-      </div>
-
-      <div class="panel">
-        <h2>Groepen</h2>
-        <form id="group-form" class="inline-form">
-          <label>Nieuwe groep
-            <input name="group" placeholder="staff, guest, byod..." required>
-          </label>
-          <label>Kopieer policy van
-            <select name="copy_from" id="copy-from-group"></select>
-          </label>
-          <button type="submit">Groep maken</button>
-        </form>
-        <div id="group-list" class="list-stack"></div>
-      </div>
-
-      <div class="panel" id="users">
-        <h2>Gebruikers en NetBird</h2>
-        <form id="user-form" class="inline-form">
-          <label>Gebruiker
-            <input name="user" placeholder="student@domein.be" required>
-          </label>
-          <label>Groepen
-            <input name="groups" placeholder="netbird_staff, byod" value="default">
-          </label>
-          <label>NetBird IP
-            <input name="ip" placeholder="100.64.x.x">
-          </label>
-          <label>Entra object id
-            <input name="entra_object_id" placeholder="optioneel">
-          </label>
-          <button type="submit">Opslaan</button>
-        </form>
-        <div id="user-list" class="list-stack"></div>
-      </div>
-
-      <div class="panel">
-        <h2>DLP regels</h2>
-        <div id="dlp-list" class="list-stack"></div>
-        <p class="hint"><a href="/edit?path=dlp_rules.json">DLP regels geavanceerd bewerken</a></p>
-      </div>
-
-      <div class="panel">
-        <h2>Service overzicht</h2>
-        <div id="service-summary" class="list-stack"></div>
-        <h2 class="spaced">Bestanden</h2>
-        <div id="files" class="list-stack"></div>
-      </div>
-
-      <div class="panel wide-panel">
-        <h2>Recente events</h2>
-        <div id="events" class="events-grid"></div>
-      </div>
-    </section>
-  </main>
-  <div id="toast" class="toast" hidden></div>
-  <script>
-    let state = null;
-    const $ = (sel) => document.querySelector(sel);
-
-    function esc(value) {
-      return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-    }
-
-    async function api(url, options = {}) {
-      const res = await fetch(url, options);
-      if (!res.ok) {
-        let detail = await res.text();
-        try { detail = JSON.parse(detail).error || detail; } catch (_) {}
-        throw new Error(detail);
-      }
-      return res.json();
-    }
-
-    async function post(url, body) {
-      return api(url, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(body)
-      });
-    }
-
-    function toast(message, ok = true) {
-      const el = $('#toast');
-      el.textContent = message;
-      el.className = ok ? 'toast ok' : 'toast error';
-      el.hidden = false;
-      clearTimeout(window.toastTimer);
-      window.toastTimer = setTimeout(() => { el.hidden = true; }, 3500);
-    }
-
-    function groupOptions(selected = 'all') {
-      const groups = ['all', ...(state?.groups || [])];
-      return groups.map(g => {
-        const label = g === 'all' ? 'Alle groepen' : g;
-        return `<option value="${esc(g)}" ${g === selected ? 'selected' : ''}>${esc(label)}</option>`;
-      }).join('');
-    }
-
-    function renderSummary() {
-      const s = state.summary;
-      $('#summary').innerHTML = [
-        ['Groepen', s.groups],
-        ['Gebruikers', s.users],
-        ['NetBird IPs', s.netbird_ips],
-        ['Categorie blocks', s.active_category_blocks],
-        ['Domeinregels', s.blocked_domains],
-        ['DLP regels', s.dlp_rules]
-      ].map(([label, value]) => `<div class="stat"><span>${esc(label)}</span><b>${esc(value)}</b></div>`).join('');
-    }
-
-    function renderSelectors() {
-      const catCurrent = $('#category-group').value || 'student';
-      $('#category-group').innerHTML = groupOptions(catCurrent);
-      if (!$('#category-group').value) $('#category-group').value = state.groups.includes('student') ? 'student' : 'all';
-      $('#domain-target').innerHTML = groupOptions($('#domain-target').value || 'all');
-      $('#copy-from-group').innerHTML = (state.groups || []).map(g => `<option value="${esc(g)}">${esc(g)}</option>`).join('');
-    }
-
-    function renderCategories() {
-      const target = $('#category-group').value || 'all';
-      const query = ($('#category-search').value || '').toLowerCase();
-      const rows = state.categories.filter(c => {
-        const text = `${c.key} ${c.en} ${c.nl}`.toLowerCase();
-        return !query || text.includes(query);
-      });
-      $('#category-list').innerHTML = rows.map(c => {
-        const direct = c.thresholds[target] !== null && c.thresholds[target] !== undefined;
-        const inherited = target !== 'all' && c.thresholds.all !== null && c.thresholds.all !== undefined;
-        const value = direct ? c.thresholds[target] : (c.default_threshold || 80);
-        const active = direct || inherited;
-        return `<div class="category-item ${active ? 'active' : ''} risk-${esc(c.risk)}" data-category="${esc(c.key)}">
-          <div class="category-copy">
-            <b>${esc(c.nl)}</b>
-            <span>${esc(c.en)} · ${esc(c.key)} · ${esc(c.phrase_rules)} phrases${c.phrase_file ? '' : ' · nog geen phrase file'}</span>
-            ${inherited ? '<em>Geblokkeerd via Alle groepen</em>' : ''}
-          </div>
-          <div class="row-actions">
-            <input class="threshold-input" type="number" min="1" max="999" value="${esc(value)}" title="Threshold">
-            <button data-action="category-enable" data-category="${esc(c.key)}">Blokkeer/Opslaan</button>
-            ${direct ? `<button class="danger-btn" data-action="category-disable" data-category="${esc(c.key)}">Deblokkeer</button>` : ''}
-          </div>
-        </div>`;
-      }).join('');
-    }
-
-    function renderDomains() {
-      $('#domain-list').innerHTML = (state.domains || []).map(row => {
-        const type = row.list === 'allowed_domains' ? 'toegestaan' : (row.list === 'hard_blocked_domains' ? 'hard block' : 'blok');
-        return `<div class="list-row">
-          <div><b>${esc(row.domain)}</b><span>${esc(row.label)} · ${esc(type)}</span></div>
-          <button class="danger-btn" data-action="domain-remove" data-domain="${esc(row.domain)}" data-target="${esc(row.target)}" data-list="${esc(row.list)}">Verwijder</button>
-        </div>`;
-      }).join('') || '<p class="hint">Nog geen domeinregels.</p>';
-    }
-
-    function renderGroups() {
-      $('#group-list').innerHTML = (state.groups || []).map(group => {
-        const policy = state.policies[group] || {};
-        const cats = Object.keys(policy.phrase_thresholds || {}).length;
-        const domains = (policy.blocked_domains || []).length;
-        return `<div class="list-row">
-          <div><b>${esc(group)}</b><span>${cats} categorieen · ${domains} geblokkeerde domeinen · DLP ${policy.dlp_enabled ? 'aan' : 'uit'}</span></div>
-          ${group === 'default' ? '' : `<button class="danger-btn" data-action="group-delete" data-group="${esc(group)}">Verwijder</button>`}
-        </div>`;
-      }).join('');
-    }
-
-    function renderUsers() {
-      const userRows = Object.entries(state.users || {}).map(([user, obj]) => {
-        const ip = Object.entries(state.ip_map || {}).find(([, map]) => map.user === user)?.[0] || '';
-        return `<div class="list-row">
-          <div><b>${esc(user)}</b><span>${esc((obj.groups || []).join(', '))}${ip ? ' · NetBird ' + esc(ip) : ''}</span></div>
-          <button class="danger-btn" data-action="user-delete" data-user="${esc(user)}" data-ip="${esc(ip)}">Verwijder</button>
-        </div>`;
-      }).join('');
-      $('#user-list').innerHTML = userRows || '<p class="hint">Nog geen gebruikers buiten defaults.</p>';
-    }
-
-    function renderDlp() {
-      const rules = state.dlp.rules || [];
-      $('#dlp-list').innerHTML = rules.map((rule, index) => `<div class="list-row">
-        <div><b>${esc(rule.name)}</b><span>${rule.enabled ? 'Actief' : 'Uit'} · ${esc(rule.builtin || rule.pattern || '')} · groepen: ${esc((rule.groups || []).join(', ') || 'alle')}</span></div>
-        <button data-action="dlp-toggle" data-index="${index}" data-enabled="${rule.enabled ? 'false' : 'true'}">${rule.enabled ? 'Uitzetten' : 'Aanzetten'}</button>
-      </div>`).join('');
-    }
-
-    function renderService() {
-      const st = state.status;
-      const rows = [
-        ['ICAP', `${st.icap.host}:${st.icap.port}`],
-        ['Dashboard', `${st.dashboard.host}:${st.dashboard.port}`],
-        ['ClamAV', st.clamav.enabled ? `aan (${st.clamav.unix_socket || st.clamav.host + ':' + st.clamav.port})` : 'uit'],
-        ['Phrase rules', st.phrase_rules],
-        ['Config versie', st.config_version]
-      ];
-      $('#service-summary').innerHTML = rows.map(([k, v]) => `<div class="list-row compact"><b>${esc(k)}</b><span>${esc(v)}</span></div>`).join('');
-      $('#files').innerHTML = (state.editable_files || []).map(f =>
-        `<a class="file" href="/edit?path=${encodeURIComponent(f.path)}">${esc(f.path)} <span>${f.size} bytes</span></a>`
-      ).join('');
-    }
-
-    function renderEvents() {
-      const events = state.events.recent || [];
-      $('#events').innerHTML = events.slice(0, 30).map(e =>
-        `<div class="event ${esc(e.action)}"><b>${esc(e.action)} / ${esc(e.reason)}</b><span>${esc(e.user)} · ${esc(e.domain)} · ${esc(e.ts)}</span></div>`
-      ).join('') || '<p class="hint">Nog geen events sinds start.</p>';
-    }
-
-    async function refresh() {
-      const selectedGroup = $('#category-group')?.value;
-      state = await api('/api/policy');
-      renderSummary();
-      renderSelectors();
-      if (selectedGroup) $('#category-group').value = selectedGroup;
-      renderCategories();
-      renderDomains();
-      renderGroups();
-      renderUsers();
-      renderDlp();
-      renderService();
-      renderEvents();
-    }
-
-    $('#reload').addEventListener('click', async () => {
-      await api('/api/reload', {method: 'POST'});
-      await refresh();
-      toast('Configuratie herladen');
-    });
-    $('#category-group').addEventListener('change', renderCategories);
-    $('#category-search').addEventListener('input', renderCategories);
-
-    $('#domain-form').addEventListener('submit', async (ev) => {
-      ev.preventDefault();
-      const data = Object.fromEntries(new FormData(ev.target).entries());
-      await post('/api/policy/domain', {...data, action: 'add'});
-      ev.target.reset();
-      await refresh();
-      toast('Domeinregel toegevoegd');
-    });
-
-    $('#group-form').addEventListener('submit', async (ev) => {
-      ev.preventDefault();
-      const data = Object.fromEntries(new FormData(ev.target).entries());
-      await post('/api/policy/group', {...data, action: 'add'});
-      ev.target.reset();
-      await refresh();
-      toast('Groep aangemaakt');
-    });
-
-    $('#user-form').addEventListener('submit', async (ev) => {
-      ev.preventDefault();
-      const data = Object.fromEntries(new FormData(ev.target).entries());
-      await post('/api/users/manage', {...data, action: 'save'});
-      await refresh();
-      toast('Gebruiker opgeslagen');
-    });
-
-    document.body.addEventListener('click', async (ev) => {
-      const btn = ev.target.closest('button[data-action]');
-      if (!btn) return;
-      const action = btn.dataset.action;
-      try {
-        if (action === 'category-enable') {
-          const row = btn.closest('.category-item');
-          const threshold = row.querySelector('.threshold-input').value;
-          await post('/api/policy/category', {target: $('#category-group').value, category: btn.dataset.category, enabled: true, threshold});
-          toast('Categorieblokkering opgeslagen');
-        } else if (action === 'category-disable') {
-          await post('/api/policy/category', {target: $('#category-group').value, category: btn.dataset.category, enabled: false});
-          toast('Categorie gedeblokkeerd');
-        } else if (action === 'domain-remove') {
-          await post('/api/policy/domain', {target: btn.dataset.target, domain: btn.dataset.domain, list: btn.dataset.list, action: 'remove'});
-          toast('Domeinregel verwijderd');
-        } else if (action === 'group-delete') {
-          await post('/api/policy/group', {group: btn.dataset.group, action: 'delete'});
-          toast('Groep verwijderd');
-        } else if (action === 'user-delete') {
-          await post('/api/users/manage', {user: btn.dataset.user, ip: btn.dataset.ip, action: 'delete'});
-          toast('Gebruiker verwijderd');
-        } else if (action === 'dlp-toggle') {
-          await post('/api/dlp/rule', {index: btn.dataset.index, enabled: btn.dataset.enabled});
-          toast('DLP regel aangepast');
-        }
-        await refresh();
-      } catch (err) {
-        toast(err.message, false);
-      }
-    });
-
-    refresh().catch(err => toast(err.message, false));
-  </script>
-</body>
-</html>"""
-    return html.replace("__DASHBOARD_CSS__", DASHBOARD_CSS)
-
-
-def render_modern_dashboard() -> str:
-    html = """<!doctype html>
-<html lang="nl">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>School ICAP Guard</title>
-  <style>__DASHBOARD_CSS__
-__MODERN_CSS__</style>
-</head>
-<body class="app-shell">
-  <aside class="sidebar" id="sidebar">
-    <div class="brand">
-      <div class="brand-mark">SG</div>
-      <div class="brand-copy"><strong>School ICAP Guard</strong><span>Security admin</span></div>
-    </div>
-    <nav class="side-nav" aria-label="Dashboard navigatie">
-      <a href="#dashboard" data-page="dashboard">Overzicht</a>
-      <a href="#events" data-page="events">Logs & events</a>
-      <a href="#users" data-page="users">Gebruikers</a>
-      <a href="#policies" data-page="policies">Policies</a>
-      <a href="#domains" data-page="domains">Domeinen</a>
-      <a href="#categories" data-page="categories">Categorieen</a>
-      <a href="#phrases" data-page="phrases">Weighted phrases</a>
-      <a href="#dlp" data-page="dlp">DLP</a>
-      <a href="#services" data-page="services">Services</a>
-      <a href="#files" data-page="files">Config files</a>
-    </nav>
-  </aside>
-  <div class="app-main">
-    <header class="topbar">
-      <div class="topbar-left">
-        <button class="icon-btn" id="sidebar-toggle" title="Sidebar inklappen">☰</button>
-        <div><h1 id="page-title">Overzicht</h1><p id="page-subtitle">Live status en recente security-activiteit</p></div>
-      </div>
-      <div class="topbar-actions">
-        <a class="ghost-btn" href="/test">Policy test</a>
-        <button class="ghost-btn" id="theme-toggle">Theme</button>
-        <button class="primary-btn" id="reload">Reload</button>
-      </div>
-    </header>
-    <main class="content">
-      <section id="page-dashboard" class="page active">
-        <div class="metric-grid" id="metrics"></div>
-        <div class="status-strip" id="status-strip"></div>
-        <div class="dashboard-grid">
-          <article class="card span-2"><div class="card-head"><h2>Totaal verkeer</h2><span>recent memory</span></div><canvas id="traffic-chart" height="150"></canvas><p class="empty" id="traffic-empty">Geen trafficdata beschikbaar</p></article>
-          <article class="card"><div class="card-head"><h2>Allowed vs blocked</h2><span>ratio</span></div><canvas id="ratio-chart" height="150"></canvas><p class="empty" id="ratio-empty">Geen logs gevonden</p></article>
-          <article class="card"><div class="card-head"><h2>Blocks per uur</h2><span>security</span></div><canvas id="blocks-chart" height="150"></canvas><p class="empty" id="blocks-empty">Geen blocks geregistreerd</p></article>
-          <article class="card"><div class="card-head"><h2>Top categorieen</h2><span>blocked</span></div><div id="top-categories" class="rank-list"></div></article>
-          <article class="card"><div class="card-head"><h2>Actieve gebruikers</h2><span>requests</span></div><div id="top-users" class="rank-list"></div></article>
-          <article class="card"><div class="card-head"><h2>Geblokkeerde domeinen</h2><span>top</span></div><div id="top-domains" class="rank-list"></div></article>
-          <article class="card span-2"><div class="card-head"><h2>Laatste blocks</h2><a href="#events">Alle events</a></div><div id="latest-blocks" class="event-list"></div></article>
-          <article class="card span-2"><div class="card-head"><h2>Snelle acties</h2><span>beheer</span></div><div id="quick-actions" class="toggle-grid"></div></article>
-        </div>
-      </section>
-
-      <section id="page-events" class="page">
-        <div class="card">
-          <div class="filter-grid">
-            <input id="event-search" placeholder="Zoeken op gebruiker, domein, reden, incident...">
-            <input id="event-user" placeholder="Gebruiker">
-            <input id="event-ip" placeholder="IP-adres">
-            <input id="event-domain" placeholder="Domein/URL">
-            <input id="event-category" placeholder="Categorie">
-            <select id="event-action"><option value="">Actie</option><option value="allow">Allowed</option><option value="block">Blocked</option></select>
-            <input id="event-date" type="date">
-            <input id="event-incident" placeholder="Incident ID">
-          </div>
-          <div class="table-wrap"><table><thead><tr><th>Timestamp</th><th>Status</th><th>Gebruiker</th><th>IP</th><th>Domein/URL</th><th>Categorie</th><th>Policy</th><th>Reden</th><th>Incident</th></tr></thead><tbody id="events-table"></tbody></table></div>
-        </div>
-        <div class="card detail-card" id="event-detail"><h2>Event details</h2><p class="empty">Selecteer een event om de details te bekijken.</p></div>
-      </section>
-
-      <section id="page-users" class="page">
-        <div class="split-grid">
-          <article class="card">
-            <div class="card-head"><h2>Gebruikers</h2><input id="user-search" placeholder="Zoek gebruiker, groep of IP"></div>
-            <div id="users-list" class="list-stack"></div>
-          </article>
-          <article class="card detail-card" id="user-detail"><h2>Gebruikersdetail</h2><p class="empty">Kies links een gebruiker.</p></article>
-        </div>
-      </section>
-
-      <section id="page-policies" class="page">
-        <div class="card">
-          <div class="card-head"><h2>Policies en groepen</h2><span>NetBird-groepen en eigen groepen</span></div>
-          <form id="group-form" class="inline-form modern-form"><label>Nieuwe groep<input name="group" placeholder="netbird_staff, byod..." required></label><label>Kopieer van<select name="copy_from" id="copy-from-group"></select></label><button class="primary-btn" type="submit">Groep maken</button></form>
-          <div id="policy-list" class="policy-grid"></div>
-        </div>
-      </section>
-
-      <section id="page-domains" class="page">
-        <div class="card">
-          <div class="card-head"><h2>Domeinblokkering en allowlist</h2><span>Allowlist heeft prioriteit boven blocklists</span></div>
-          <form id="domain-form" class="inline-form modern-form"><label>Voor<select name="target" id="domain-target"></select></label><label>Actie<select name="list"><option value="allowed_domains">Toestaan</option><option value="blocked_domains">Blokkeren</option><option value="hard_blocked_domains">Hard block alle groepen</option></select></label><label>Domein<input name="domain" placeholder="example.com of *.example.com" required></label><button class="primary-btn" type="submit">Toevoegen</button></form>
-          <input id="domain-search" placeholder="Zoek domeinregel">
-          <div class="table-wrap"><table><thead><tr><th>Domein</th><th>Scope</th><th>Type</th><th>Status</th><th>Hits</th><th></th></tr></thead><tbody id="domains-table"></tbody></table></div>
-        </div>
-      </section>
-
-      <section id="page-categories" class="page">
-        <div class="card">
-          <div class="card-head"><h2>Categorieen</h2><span>Phrase-blocking blijft uit tot je het expliciet activeert</span></div>
-          <div class="toolbar modern-toolbar"><label>Groep<select id="category-group"></select></label><label>Zoeken<input id="category-search" placeholder="adult, malware, social..."></label></div>
-          <div id="category-list" class="category-list"></div>
-        </div>
-      </section>
-
-      <section id="page-phrases" class="page">
-        <div class="card">
-          <div class="card-head"><h2>Weighted phrases</h2><span>Standaard uitgeschakeld</span></div>
-          <div class="notice">Weighted phrases zijn alleen actief wanneer de globale instelling aanstaat en een policy thresholds heeft. Auto-generated seedlijsten worden veilig naar <code>.disabled</code> hernoemd.</div>
-          <div id="phrase-list" class="policy-grid"></div>
-        </div>
-      </section>
-
-      <section id="page-dlp" class="page">
-        <div class="card">
-          <div class="card-head"><h2>DLP regels</h2><span>Alleen REQMOD + HTTP POST body</span></div>
-          <div class="notice">DLP scant geen gewone pagina-inhoud, URL, headers of response bodies. Webfiltering en phrase-scoring blijven apart.</div>
-          <div id="dlp-list" class="list-stack"></div>
-          <p class="hint"><a href="/edit?path=dlp_rules.json">DLP regels geavanceerd bewerken</a></p>
-        </div>
-      </section>
-
-      <section id="page-services" class="page">
-        <div class="card"><div class="card-head"><h2>Services/status</h2><span>veilige backend hooks</span></div><div id="service-cards" class="service-grid"></div><div id="todo-hooks" class="notice"></div></div>
-      </section>
-
-      <section id="page-files" class="page">
-        <div class="card"><div class="card-head"><h2>Config bestanden</h2><span>backups bij opslaan</span></div><div id="files" class="file-grid"></div></div>
-      </section>
-    </main>
-    <footer>Copyright © 2026 Youness Banali El Khattabi</footer>
-  </div>
-  <div id="toast" class="toast" hidden></div>
-  <script>
-    let state = null;
-    let selectedEvent = null;
-    let selectedUser = null;
-    const pages = {
-      dashboard: ['Overzicht', 'Live status en recente security-activiteit'],
-      events: ['Logs & events', 'Zoeken, filteren en incidenten bekijken'],
-      users: ['Gebruikers', 'NetBird peers, groepen en recente geschiedenis'],
-      policies: ['Policies', 'Groepen en toegepaste regels'],
-      domains: ['Domeinen', 'Allowlist, blocklist en hard blocks'],
-      categories: ['Categorieen', 'UT1/E2Guardian-categorieen en thresholds'],
-      phrases: ['Weighted phrases', 'Phrase status en beheer'],
-      dlp: ['DLP', 'Body-only datalekpreventie'],
-      services: ['Services', 'ICAP, NetBird, DLP, ClamAV en configstatus'],
-      files: ['Config files', 'Geavanceerde configuratie']
-    };
-    const $ = (sel) => document.querySelector(sel);
-    const $$ = (sel) => Array.from(document.querySelectorAll(sel));
-    const esc = (value) => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-    async function api(url, options = {}) {
-      const res = await fetch(url, options);
-      if (!res.ok) {
-        let detail = await res.text();
-        try { detail = JSON.parse(detail).error || detail; } catch (_) {}
-        throw new Error(detail);
-      }
-      return res.json();
-    }
-    const post = (url, body) => api(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
-    function toast(message, ok = true) {
-      const el = $('#toast'); el.textContent = message; el.className = ok ? 'toast ok' : 'toast error'; el.hidden = false;
-      clearTimeout(window.toastTimer); window.toastTimer = setTimeout(() => { el.hidden = true; }, 3200);
-    }
-    function badge(label, tone) { return `<span class="badge ${tone || ''}">${esc(label)}</span>`; }
-    function groupOptions(selected = 'all') {
-      const groups = ['all', ...(state?.groups || [])];
-      return groups.map(g => `<option value="${esc(g)}" ${g === selected ? 'selected' : ''}>${esc(g === 'all' ? 'Alle groepen' : g)}</option>`).join('');
-    }
-    function pageFromHash() { return (location.hash || '#dashboard').slice(1); }
-    function showPage(page) {
-      if (!pages[page]) page = 'dashboard';
-      $$('.page').forEach(el => el.classList.toggle('active', el.id === `page-${page}`));
-      $$('.side-nav a').forEach(a => a.classList.toggle('active', a.dataset.page === page));
-      $('#page-title').textContent = pages[page][0];
-      $('#page-subtitle').textContent = pages[page][1];
-    }
-    function metric(label, value, hint) { return `<article class="metric"><span>${esc(label)}</span><strong>${esc(value)}</strong><small>${esc(hint || '')}</small></article>`; }
-    function renderMetrics() {
-      const s = state.summary, f = state.status.features;
-      const rows = [
-        metric('Gebruikers', s.users, `${s.netbird_ips} NetBird IPs`),
-        metric('Policies', s.groups, 'custom/NetBird groepen'),
-        metric('Geblokkeerde domeinen', s.blocked_domains, `${s.allowed_domains} allowed`),
-        metric('Categorieen', s.categories, `${s.active_category_blocks} actief`),
-        f.weighted_phrases_enabled ? metric('Weighted phrases', s.phrase_rules, 'actieve rules') : '',
-        metric('Events', s.events, 'persistent events.jsonl')
-      ].filter(Boolean);
-      $('#metrics').innerHTML = rows.join('');
-    }
-    function renderStatusStrip() {
-      const st = state.status, f = st.features;
-      const items = [
-        ['ICAP', true, `${st.icap.host}:${st.icap.port}`],
-        ['NetBird sync', f.netbird_sync_enabled, f.netbird_sync_enabled ? 'hook actief' : 'frontend hook/TODO'],
-        ['Antivirus', f.antivirus_enabled, st.clamav.fail_open ? 'fail-open' : 'fail-closed'],
-        ['DLP', f.dlp_enabled, 'POST body only'],
-        ['Webfilter', f.webfiltering_enabled, f.domain_blocking_enabled ? 'domains actief' : 'domains uit'],
-        ['Logging', f.logging_enabled, state.events.log_path || 'events.jsonl']
-      ];
-      $('#status-strip').innerHTML = items.map(([name, ok, hint]) => `<div class="status-pill">${badge(ok ? 'online' : 'uit', ok ? 'ok' : 'muted')}<div><b>${esc(name)}</b><span>${esc(hint)}</span></div></div>`).join('');
-    }
-    function drawBars(id, data, color) {
-      const canvas = document.getElementById(id), empty = document.getElementById(id.replace('-chart', '-empty'));
-      const entries = Object.entries(data || {}).slice(-12);
-      if (empty) empty.hidden = entries.length > 0;
-      if (!canvas || !entries.length) return;
-      const dpr = window.devicePixelRatio || 1, rect = canvas.getBoundingClientRect();
-      canvas.width = Math.max(320, rect.width) * dpr; canvas.height = 150 * dpr;
-      const ctx = canvas.getContext('2d'); ctx.scale(dpr, dpr); ctx.clearRect(0,0,canvas.width,canvas.height);
-      const max = Math.max(1, ...entries.map(([,v]) => v)); const w = rect.width / entries.length;
-      entries.forEach(([k,v], i) => { const h = (v / max) * 104; ctx.fillStyle = color; ctx.fillRect(i*w + 7, 126-h, Math.max(12, w-14), h); ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--muted'); ctx.font='11px sans-serif'; ctx.fillText(k.slice(-5), i*w+6, 144); });
-    }
-    function drawRatio() {
-      const c = $('#ratio-chart'), empty = $('#ratio-empty'); const allowed = state.analytics.allowed || 0, blocked = state.analytics.blocked || 0, total = allowed + blocked;
-      empty.hidden = total > 0; if (!total) return;
-      const dpr = window.devicePixelRatio || 1, rect = c.getBoundingClientRect(); c.width = Math.max(260, rect.width) * dpr; c.height = 150 * dpr;
-      const ctx = c.getContext('2d'); ctx.scale(dpr,dpr); const cx = rect.width/2, cy = 75, r = 54; ctx.clearRect(0,0,rect.width,150);
-      let start = -Math.PI/2; [[allowed,'#168251'],[blocked,'#b42318']].forEach(([val,color]) => { const end = start + (val/total)*Math.PI*2; ctx.beginPath(); ctx.moveTo(cx,cy); ctx.arc(cx,cy,r,start,end); ctx.closePath(); ctx.fillStyle=color; ctx.fill(); start=end; });
-      ctx.fillStyle = getComputedStyle(document.body).getPropertyValue('--text'); ctx.font='700 18px sans-serif'; ctx.textAlign='center'; ctx.fillText(`${Math.round((allowed/total)*100)}% OK`, cx, cy+6);
-    }
-    function rankList(id, rows, empty) {
-      $(id).innerHTML = (rows || []).map(([name, value]) => `<div class="rank-row"><span>${esc(name || 'onbekend')}</span><b>${esc(value.total || value)}</b></div>`).join('') || `<p class="empty">${esc(empty)}</p>`;
-    }
-    function renderCharts() {
-      drawBars('traffic-chart', state.analytics.traffic_by_hour, '#0f6f95');
-      drawBars('blocks-chart', state.analytics.blocks_by_hour, '#b42318');
-      drawRatio();
-      rankList('#top-categories', state.analytics.top_blocked_categories, 'Geen blocks geregistreerd');
-      rankList('#top-users', state.analytics.top_users.map(([u,v]) => [u, v.total]), 'Geen gebruikersactiviteit');
-      rankList('#top-domains', state.analytics.top_blocked_domains, 'Geen geblokkeerde domeinen');
-    }
-    function eventReason(e) {
-      if (e.reason === 'dlp') return 'DLP-regel op POST body';
-      if (e.reason === 'domain') return 'Domeinregel/blocklist';
-      if (e.reason === 'phrase') return 'Weighted phrase threshold';
-      if (e.reason === 'allowed_domain') return 'Allowlist prioriteit';
-      if (e.reason === 'malware') return 'ClamAV detectie';
-      return e.public_reason || e.reason || 'Onbekend';
-    }
-    function filteredEvents() {
-      const events = state.events.recent || [];
-      const filters = {
-        q: $('#event-search')?.value.toLowerCase() || '', user: $('#event-user')?.value.toLowerCase() || '',
-        ip: $('#event-ip')?.value.toLowerCase() || '', domain: $('#event-domain')?.value.toLowerCase() || '',
-        category: $('#event-category')?.value.toLowerCase() || '', action: $('#event-action')?.value || '',
-        date: $('#event-date')?.value || '', incident: $('#event-incident')?.value.toLowerCase() || ''
-      };
-      return events.filter(e => {
-        const hay = JSON.stringify(e).toLowerCase();
-        return (!filters.q || hay.includes(filters.q)) && (!filters.user || String(e.user||'').toLowerCase().includes(filters.user)) &&
-          (!filters.ip || String(e.source_ip||'').toLowerCase().includes(filters.ip)) && (!filters.domain || (`${e.domain||''} ${e.url||''}`).toLowerCase().includes(filters.domain)) &&
-          (!filters.category || (`${e.category||''} ${e.reason||''}`).toLowerCase().includes(filters.category)) && (!filters.action || e.action === filters.action) &&
-          (!filters.date || String(e.ts||'').startsWith(filters.date)) && (!filters.incident || String(e.incident_id||'').toLowerCase().includes(filters.incident));
-      });
-    }
-    function renderEvents() {
-      const rows = filteredEvents();
-      $('#events-table').innerHTML = rows.map((e, i) => `<tr data-event="${i}"><td>${esc(e.ts||'')}</td><td>${badge(e.action || 'unknown', e.action === 'block' ? 'bad' : 'ok')}</td><td>${esc(e.user||'')}</td><td>${esc(e.source_ip||'')}</td><td>${esc(e.domain||e.url||'')}</td><td>${esc(e.category||e.reason||'')}</td><td>${esc(e.policy||'')}</td><td>${esc(eventReason(e))}</td><td><code>${esc(e.incident_id||'')}</code></td></tr>`).join('') || '<tr><td colspan="9" class="empty">Geen logs gevonden</td></tr>';
-      selectedEvent = rows[0] || null; renderEventDetail();
-    }
-    function renderEventDetail() {
-      const e = selectedEvent; if (!e) { $('#event-detail').innerHTML = '<h2>Event details</h2><p class="empty">Selecteer een event om de details te bekijken.</p>'; return; }
-      const rule = (e.dlp_hits||[])[0]?.name || (e.phrase_hits||[])[0]?.phrase || e.category || e.reason;
-      $('#event-detail').innerHTML = `<h2>Event details</h2><dl class="detail-list"><dt>Incident</dt><dd>${esc(e.incident_id)}</dd><dt>Gebruiker</dt><dd>${esc(e.user)}</dd><dt>IP-adres</dt><dd>${esc(e.source_ip)}</dd><dt>URL/domein</dt><dd>${esc(e.url || e.domain)}</dd><dt>Policy</dt><dd>${esc(e.policy)}</dd><dt>Actie</dt><dd>${badge(e.action, e.action === 'block' ? 'bad' : 'ok')}</dd><dt>Waarom</dt><dd>${esc(eventReason(e))}</dd><dt>Regel</dt><dd>${esc(rule || 'n.v.t.')}</dd></dl><pre>${esc(JSON.stringify(e, null, 2))}</pre>`;
-    }
-    function renderLatestBlocks() {
-      const blocks = (state.events.recent || []).filter(e => e.action === 'block').slice(0, 8);
-      $('#latest-blocks').innerHTML = blocks.map(e => `<div class="mini-event"><b>${esc(e.domain || e.url || 'onbekend')}</b><span>${esc(e.user)} · ${esc(eventReason(e))} · ${esc(e.ts)}</span></div>`).join('') || '<p class="empty">Geen blocks geregistreerd</p>';
-    }
-    function renderQuickActions() {
-      const f = state.status.features;
-      const toggles = [
-        ['webfiltering_enabled','Webfiltering'], ['domain_blocking_enabled','Domeinblokkering'], ['weighted_phrases_enabled','Weighted phrases'],
-        ['dlp_enabled','DLP'], ['antivirus_enabled','Antivirus'], ['logging_enabled','Logging'], ['netbird_sync_enabled','NetBird sync hook'],
-        ['allow_domains_bypass_content','Allow domains bypass content'], ['clamav_fail_open','ClamAV fail-open'], ['dlp_fail_open','DLP fail-open hook'], ['webfilter_fail_open','Webfilter fail-open hook']
-      ];
-      $('#quick-actions').innerHTML = toggles.map(([key,label]) => `<label class="switch-row"><span>${esc(label)}</span><input type="checkbox" data-setting="${key}" ${f[key] ? 'checked' : ''}></label>`).join('');
-    }
-    function renderSelectors() {
-      const cat = $('#category-group')?.value || 'all';
-      $('#category-group').innerHTML = groupOptions(cat); $('#domain-target').innerHTML = groupOptions($('#domain-target').value || 'all');
-      $('#copy-from-group').innerHTML = ['all', ...(state.groups || [])].map(g => `<option value="${esc(g)}">${esc(g === 'all' ? 'common_policy' : g)}</option>`).join('');
-    }
-    function renderPolicies() {
-      $('#policy-list').innerHTML = (state.groups || []).map(group => {
-        const p = state.policies[group] || {}; const cats = Object.keys(p.phrase_thresholds || {}).length;
-        return `<div class="policy-card"><div><h3>${esc(group)}</h3><p>${esc((p.blocked_domains||[]).length)} blocked · ${esc((p.allowed_domains||[]).length)} allowed · ${cats} phrase thresholds</p></div><div>${badge(p.dlp_enabled === false ? 'DLP uit' : 'DLP aan', p.dlp_enabled === false ? 'muted' : 'ok')} ${badge(p.malware === false ? 'AV uit' : 'AV aan', p.malware === false ? 'muted' : 'ok')}</div><button class="danger-btn" data-action="group-delete" data-group="${esc(group)}">Verwijder</button></div>`;
-      }).join('') || '<p class="empty">Nog geen groep-policies. NetBird sync of handmatige groepen kunnen ze aanmaken.</p>';
-    }
-    function renderDomains() {
-      const q = ($('#domain-search')?.value || '').toLowerCase();
-      const rows = (state.domains || []).filter(r => (`${r.domain} ${r.label} ${r.list}`).toLowerCase().includes(q));
-      $('#domains-table').innerHTML = rows.map(r => `<tr><td>${esc(r.domain)}</td><td>${esc(r.label)}</td><td>${badge(r.list === 'allowed_domains' ? 'allowlist' : r.list === 'hard_blocked_domains' ? 'hard block' : 'blocklist', r.list === 'allowed_domains' ? 'ok' : 'bad')}</td><td>${esc(r.list === 'allowed_domains' ? 'prioriteit boven blacklist' : 'actief')}</td><td>${esc((state.events.recent||[]).filter(e => e.domain === r.domain).length)}</td><td><button class="danger-btn" data-action="domain-remove" data-domain="${esc(r.domain)}" data-target="${esc(r.target)}" data-list="${esc(r.list)}">Verwijder</button></td></tr>`).join('') || '<tr><td colspan="6" class="empty">Geen domeinregels gevonden</td></tr>';
-    }
-    function renderCategories() {
-      const target = $('#category-group').value || 'all'; const query = ($('#category-search').value || '').toLowerCase();
-      const phraseOn = state.status.features.weighted_phrases_enabled;
-      const rows = state.categories.filter(c => (`${c.key} ${c.en} ${c.nl}`).toLowerCase().includes(query));
-      $('#category-list').innerHTML = rows.map(c => {
-        const direct = c.thresholds[target] !== null && c.thresholds[target] !== undefined; const inherited = target !== 'all' && c.thresholds.all !== null && c.thresholds.all !== undefined;
-        const active = phraseOn && (direct || inherited); const value = direct ? c.thresholds[target] : (c.default_threshold || 80);
-        return `<div class="category-item ${active ? 'active' : ''} risk-${esc(c.risk)}"><div class="category-copy"><b>${esc(c.nl)}</b><span>${esc(c.en)} · ${esc(c.key)} · ${esc(c.phrase_rules)} phrases · ${phraseOn ? 'engine aan' : 'engine uit'}</span>${inherited ? '<em>Geerfd via alle groepen</em>' : ''}</div><div class="row-actions"><input class="threshold-input" type="number" min="0" max="999" value="${esc(value)}"><button data-action="category-enable" data-category="${esc(c.key)}">Opslaan</button>${direct ? `<button class="danger-btn" data-action="category-disable" data-category="${esc(c.key)}">Uit</button>` : ''}</div></div>`;
-      }).join('');
-    }
-    function renderPhrases() {
-      $('#phrase-list').innerHTML = state.categories.map(c => `<div class="policy-card"><div><h3>${esc(c.nl)}</h3><p>${esc(c.key)} · ${esc(c.phrase_rules)} geladen rules · ${c.phrase_file ? 'map aanwezig' : 'lege categorie'}</p></div>${badge(state.status.features.weighted_phrases_enabled && c.phrase_rules ? 'actief mogelijk' : 'uit/leeg', state.status.features.weighted_phrases_enabled && c.phrase_rules ? 'ok' : 'muted')}</div>`).join('');
-    }
-    function userRows() {
-      const users = Object.entries(state.users || {}).map(([user, obj]) => ({user, obj, ips: Object.entries(state.ip_map || {}).filter(([,map]) => map.user === user).map(([ip]) => ip)}));
-      const q = ($('#user-search')?.value || '').toLowerCase();
-      return users.filter(row => JSON.stringify(row).toLowerCase().includes(q));
-    }
-    function renderUsers() {
-      const rows = userRows(); selectedUser = selectedUser || rows[0]?.user || null;
-      $('#users-list').innerHTML = rows.map(row => `<button class="user-row ${selectedUser === row.user ? 'active' : ''}" data-user="${esc(row.user)}"><b>${esc(row.user)}</b><span>${esc((row.obj.groups||[]).join(', ') || 'geen groepen')} ${row.ips.length ? '· ' + esc(row.ips.join(', ')) : ''}</span></button>`).join('') || '<p class="empty">Geen gebruikers gevonden</p>';
-      renderUserDetail();
-    }
-    function renderUserDetail() {
-      const user = selectedUser, obj = (state.users || {})[user]; if (!user || !obj) { $('#user-detail').innerHTML = '<h2>Gebruikersdetail</h2><p class="empty">Kies links een gebruiker.</p>'; return; }
-      const events = (state.events.recent || []).filter(e => e.user === user); const blocks = events.filter(e => e.action === 'block');
-      const ips = Object.entries(state.ip_map || {}).filter(([,map]) => map.user === user).map(([ip]) => ip);
-      $('#user-detail').innerHTML = `<h2>${esc(user)}</h2><dl class="detail-list"><dt>Naam</dt><dd>${esc(obj.name || user)}</dd><dt>E-mail</dt><dd>${esc(user)}</dd><dt>IP-adressen</dt><dd>${esc(ips.join(', ') || 'onbekend')}</dd><dt>NetBird peer info</dt><dd>${esc([...(obj.netbird_hostnames||[]), ...(obj.netbird_peer_ids||[])].join(', ') || 'niet beschikbaar')}</dd><dt>Groepen</dt><dd>${esc((obj.groups||[]).join(', ') || 'geen')}</dd><dt>Policies</dt><dd>${esc((obj.groups||[]).filter(g => state.policies[g]).join(', ') || 'common_policy')}</dd><dt>Allowed requests</dt><dd>${events.filter(e => e.action === 'allow').length}</dd><dt>Blocked requests</dt><dd>${blocks.length}</dd></dl><h3>Recente blocks</h3><div class="event-list">${blocks.slice(0,8).map(e => `<div class="mini-event"><b>${esc(e.domain||e.url)}</b><span>${esc(eventReason(e))} · regel: ${esc(e.category||e.reason)}</span></div>`).join('') || '<p class="empty">Geen recente blocks</p>'}</div><h3>Geschiedenis</h3><div class="event-list">${events.slice(0,12).map(e => `<div class="mini-event"><b>${esc(e.action)} · ${esc(e.domain||e.url)}</b><span>${esc(e.ts)} · ${esc(e.policy||'common')}</span></div>`).join('') || '<p class="empty">Geen recente logs</p>'}</div>`;
-    }
-    function renderDlp() {
-      const rules = state.dlp.rules || [];
-      $('#dlp-list').innerHTML = rules.map((rule, index) => `<div class="list-row"><div><b>${esc(rule.name)}</b><span>${rule.enabled ? 'Actief' : 'Uit'} · ${esc(rule.builtin || rule.pattern || '')} · groepen: ${esc((rule.groups || []).join(', ') || 'alle')}</span></div><button data-action="dlp-toggle" data-index="${index}" data-enabled="${rule.enabled ? 'false' : 'true'}">${rule.enabled ? 'Uitzetten' : 'Aanzetten'}</button></div>`).join('') || '<p class="empty">Geen DLP regels gevonden</p>';
-    }
-    function renderServices() {
-      const st = state.status, f = st.features;
-      const rows = [['ICAP', true, `${st.icap.host}:${st.icap.port}`], ['NetBird sync', f.netbird_sync_enabled, 'UI hook, script/scheduler extern'], ['Webfilter', f.webfiltering_enabled, f.domain_blocking_enabled ? 'domain blocking aan' : 'domain blocking uit'], ['DLP', f.dlp_enabled, 'REQMOD POST body only'], ['Antivirus/ClamAV', f.antivirus_enabled, f.clamav_fail_open ? 'fail-open' : 'fail-closed'], ['Logging', f.logging_enabled, state.events.log_path], ['Config', true, st.config_version]];
-      $('#service-cards').innerHTML = rows.map(([name, ok, hint]) => `<div class="service-card"><h3>${esc(name)}</h3>${badge(ok ? 'OK' : 'UIT/TODO', ok ? 'ok' : 'muted')}<p>${esc(hint)}</p></div>`).join('');
-      $('#todo-hooks').innerHTML = Object.entries(st.todos || {}).map(([k,v]) => `<p><b>${esc(k)}</b>: ${esc(v)}</p>`).join('');
-    }
-    function renderFiles() {
-      $('#files').innerHTML = (state.editable_files || []).map(f => `<a class="file-tile" href="/edit?path=${encodeURIComponent(f.path)}"><b>${esc(f.path)}</b><span>${esc(f.size)} bytes · ${esc(f.mtime)}</span></a>`).join('') || '<p class="empty">Geen bewerkbare bestanden</p>';
-    }
-    async function refresh() {
-      state = await api('/api/policy');
-      renderMetrics(); renderStatusStrip(); renderSelectors(); renderCharts(); renderLatestBlocks(); renderQuickActions(); renderEvents(); renderPolicies(); renderDomains(); renderCategories(); renderPhrases(); renderUsers(); renderDlp(); renderServices(); renderFiles();
-    }
-    function initPrefs() {
-      const collapsed = localStorage.getItem('icap.sidebar.collapsed') === '1';
-      document.body.classList.toggle('sidebar-collapsed', collapsed);
-      const theme = localStorage.getItem('icap.theme') || 'auto';
-      if (theme !== 'auto') document.body.dataset.theme = theme;
-    }
-    initPrefs(); showPage(pageFromHash());
-    window.addEventListener('hashchange', () => showPage(pageFromHash()));
-    $('#sidebar-toggle').addEventListener('click', () => { document.body.classList.toggle('sidebar-collapsed'); localStorage.setItem('icap.sidebar.collapsed', document.body.classList.contains('sidebar-collapsed') ? '1' : '0'); });
-    $('#theme-toggle').addEventListener('click', () => { const next = document.body.dataset.theme === 'dark' ? 'light' : 'dark'; document.body.dataset.theme = next; localStorage.setItem('icap.theme', next); });
-    $('#reload').addEventListener('click', async () => { await api('/api/reload', {method:'POST'}); await refresh(); toast('Configuratie herladen'); });
-    ['event-search','event-user','event-ip','event-domain','event-category','event-action','event-date','event-incident'].forEach(id => document.addEventListener('input', ev => { if (ev.target.id === id) renderEvents(); }));
-    document.addEventListener('change', async ev => { if (ev.target.matches('input[data-setting]')) { try { await post('/api/settings', {key: ev.target.dataset.setting, enabled: ev.target.checked}); await refresh(); toast('Instelling opgeslagen'); } catch (err) { toast(err.message, false); } } });
-    document.addEventListener('click', async ev => {
-      const eventRow = ev.target.closest('tr[data-event]'); if (eventRow) { selectedEvent = filteredEvents()[Number(eventRow.dataset.event)]; renderEventDetail(); return; }
-      const userRow = ev.target.closest('.user-row'); if (userRow) { selectedUser = userRow.dataset.user; renderUsers(); return; }
-      const btn = ev.target.closest('button[data-action]'); if (!btn) return;
-      try {
-        if (btn.dataset.action === 'domain-remove') await post('/api/policy/domain', {target: btn.dataset.target, domain: btn.dataset.domain, list: btn.dataset.list, action:'remove'});
-        if (btn.dataset.action === 'group-delete') await post('/api/policy/group', {group: btn.dataset.group, action:'delete'});
-        if (btn.dataset.action === 'category-enable') { const row = btn.closest('.category-item'); await post('/api/policy/category', {target: $('#category-group').value, category: btn.dataset.category, enabled:true, threshold: row.querySelector('.threshold-input').value}); }
-        if (btn.dataset.action === 'category-disable') await post('/api/policy/category', {target: $('#category-group').value, category: btn.dataset.category, enabled:false});
-        if (btn.dataset.action === 'dlp-toggle') await post('/api/dlp/rule', {index: btn.dataset.index, enabled: btn.dataset.enabled});
-        await refresh(); toast('Wijziging opgeslagen');
-      } catch (err) { toast(err.message, false); }
-    });
-    $('#domain-form').addEventListener('submit', async ev => { ev.preventDefault(); try { await post('/api/policy/domain', {...Object.fromEntries(new FormData(ev.target).entries()), action:'add'}); ev.target.reset(); await refresh(); toast('Domeinregel toegevoegd'); } catch (err) { toast(err.message, false); } });
-    $('#group-form').addEventListener('submit', async ev => { ev.preventDefault(); try { await post('/api/policy/group', {...Object.fromEntries(new FormData(ev.target).entries()), action:'add'}); ev.target.reset(); await refresh(); toast('Groep aangemaakt'); } catch (err) { toast(err.message, false); } });
-    $('#category-group').addEventListener('change', renderCategories); $('#category-search').addEventListener('input', renderCategories); $('#domain-search').addEventListener('input', renderDomains); $('#user-search').addEventListener('input', renderUsers);
-    refresh().catch(err => toast(err.message, false));
-  </script>
-</body>
-</html>"""
-    return html.replace("__DASHBOARD_CSS__", DASHBOARD_CSS).replace("__MODERN_CSS__", MODERN_DASHBOARD_CSS)
-
-
-def render_dashboard() -> str:
-    return f"""<!doctype html>
-<html lang="nl">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>School ICAP Guard</title>
-  <style>{DASHBOARD_CSS}</style>
-</head>
-<body>
-  <header>
-    <h1>School ICAP Guard</h1>
-    <nav>
-      <a href="/">Status</a>
-      <a href="/edit?path=config.json">Config</a>
-      <a href="/edit?path=users.json">Users</a>
-      <a href="/edit?path=dlp_rules.json">DLP</a>
-      <a href="/test">Test</a>
-    </nav>
-  </header>
-  <main>
-    <section class="panel">
-      <div class="panel-head">
-        <h2>Status</h2>
-        <button id="reload">Reload</button>
-      </div>
-      <pre id="status">laden...</pre>
-    </section>
-    <section class="grid">
-      <div class="panel">
-        <h2>Bestanden</h2>
-        <div id="files"></div>
-      </div>
-      <div class="panel">
-        <h2>Events</h2>
-        <div id="events"></div>
-      </div>
-    </section>
-  </main>
-  <script>
-    async function getJSON(url) {{
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(await res.text());
-      return res.json();
-    }}
-    function esc(s) {{
-      return String(s ?? '').replace(/[&<>"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
-    }}
-    async function refresh() {{
-      const status = await getJSON('/api/status');
-      document.getElementById('status').textContent = JSON.stringify(status, null, 2);
-      document.getElementById('files').innerHTML = status.editable_files.map(f =>
-        `<a class="file" href="/edit?path=${{encodeURIComponent(f.path)}}">${{esc(f.path)}} <span>${{f.size}} bytes</span></a>`
-      ).join('');
-      const events = await getJSON('/api/events');
-      document.getElementById('events').innerHTML = events.recent.slice(0, 40).map(e =>
-        `<div class="event ${{e.action}}"><b>${{esc(e.action)}}/${{esc(e.reason)}}</b><span>${{esc(e.user)}} · ${{esc(e.domain)}} · ${{esc(e.ts)}}</span></div>`
-      ).join('');
-    }}
-    document.getElementById('reload').addEventListener('click', async () => {{
-      await fetch('/api/reload', {{method: 'POST'}});
-      await refresh();
-    }});
-    refresh().catch(err => document.getElementById('status').textContent = err);
-  </script>
 </body>
 </html>"""
 
@@ -3315,314 +2999,1552 @@ def render_editor(path: str, content: str) -> str:
     escaped_path = html_lib.escape(path)
     escaped_content = html_lib.escape(content)
     return f"""<!doctype html>
-<html lang="nl">
+<html lang="nl" data-theme="auto">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{escaped_path}</title>
+  <title>{escaped_path} | Editor</title>
   <style>{DASHBOARD_CSS}</style>
 </head>
 <body>
-  <header>
-    <h1>{escaped_path}</h1>
-    <nav><a href="/">Status</a><a href="/test">Test</a></nav>
-  </header>
-  <main>
-    <form method="post" action="/save" class="editor">
-      <input type="hidden" name="path" value="{escaped_path}">
-      <textarea name="content" spellcheck="false">{escaped_content}</textarea>
-      <div class="actions">
-        <button type="submit">Opslaan en reload</button>
-        <a class="button" href="/">Terug</a>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">SI</span>
+      <div class="brand-text">
+        <strong>School ICAP Guard</strong>
+        <small>Bestand bewerken: {escaped_path}</small>
       </div>
-    </form>
-  </main>
-</body>
-</html>"""
-
-
-def render_test_page() -> str:
-    return f"""<!doctype html>
-<html lang="nl">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Policy test</title>
-  <style>{DASHBOARD_CSS}</style>
-</head>
-<body>
-  <header>
-    <h1>Policy test</h1>
-    <nav><a href="/">Status</a><a href="/edit?path=config.json">Config</a></nav>
+    </div>
+    <nav class="topbar-actions">
+      <a class="btn" href="/">Terug naar dashboard</a>
+      <button class="btn" onclick="toggleTheme()">Thema</button>
+    </nav>
   </header>
-  <main>
-    <section class="panel">
-      <form id="test-form" class="test-grid">
-        <label>URL<input name="url" value="https://example.org/"></label>
-        <label>Gebruiker<input name="user" value="student@example.org"></label>
-        <label>Groepen<input name="groups" value="default"></label>
-        <label>ICAP richting<select name="direction"><option value="reqmod">REQMOD</option><option value="respmod">RESPMOD</option></select></label>
-        <label>HTTP methode<select name="http_method"><option value="GET">GET</option><option value="POST">POST</option><option value="PUT">PUT</option></select></label>
-        <label>Content-Type<input name="content_type" value="text/plain"></label>
-        <label class="check"><input name="skip_clamav" type="checkbox" checked> ClamAV overslaan</label>
-        <label class="wide">Body<textarea name="body">casino test</textarea></label>
-        <button type="submit">Test policy</button>
+  <main class="content">
+    <section class="panel editor-panel">
+      <header class="panel-head">
+        <h2>{escaped_path}</h2>
+        <p class="hint">Wijzigingen worden veilig opgeslagen met automatische backup in <code>.backups/</code>.</p>
+      </header>
+      <form method="post" action="/save" class="editor">
+        <input type="hidden" name="path" value="{escaped_path}">
+        <textarea name="content" spellcheck="false">{escaped_content}</textarea>
+        <div class="actions">
+          <button type="submit" class="primary">Opslaan en herladen</button>
+          <a class="btn" href="/">Annuleer</a>
+        </div>
       </form>
     </section>
-    <section class="panel"><pre id="result"></pre></section>
   </main>
+  <footer class="page-footer">
+    <span>Copyright &copy; 2026 Youness Banali El Khattabi</span>
+  </footer>
   <script>
-    document.getElementById('test-form').addEventListener('submit', async (ev) => {{
-      ev.preventDefault();
-      const form = new FormData(ev.target);
-      const data = Object.fromEntries(form.entries());
-      if (!form.has('skip_clamav')) data.skip_clamav = 'off';
-      const res = await fetch('/api/test', {{method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify(data)}});
-      document.getElementById('result').textContent = JSON.stringify(await res.json(), null, 2);
-    }});
+    function toggleTheme() {{
+      const root = document.documentElement;
+      const cur = root.getAttribute('data-theme') || 'auto';
+      const next = cur === 'dark' ? 'light' : (cur === 'light' ? 'auto' : 'dark');
+      root.setAttribute('data-theme', next);
+      try {{ localStorage.setItem('sig-theme', next); }} catch (_) {{}}
+    }}
+    try {{ const t = localStorage.getItem('sig-theme'); if (t) document.documentElement.setAttribute('data-theme', t); }} catch (_) {{}}
   </script>
 </body>
 </html>"""
 
 
-DASHBOARD_CSS = """
+def render_dashboard_app() -> str:
+    """Multi-page SPA. Server stuurt deze HTML voor /, /home, /users, /logs, ..."""
+    return DASHBOARD_HTML.replace("__DASHBOARD_CSS__", DASHBOARD_CSS).replace("__DASHBOARD_JS__", DASHBOARD_JS)
+
+
+DASHBOARD_HTML = """<!doctype html>
+<html lang="nl" data-theme="auto">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>School ICAP Guard</title>
+  <style>__DASHBOARD_CSS__</style>
+</head>
+<body>
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <span class="brand-mark">SI</span>
+      <div class="brand-text">
+        <strong>School ICAP Guard</strong>
+        <small>Webfilter &amp; security console</small>
+      </div>
+    </div>
+    <nav class="side-nav" id="side-nav">
+      <a data-route="/home"><span class="ic">⌂</span>Dashboard</a>
+      <a data-route="/logs"><span class="ic">⧉</span>Logs &amp; events</a>
+      <a data-route="/users"><span class="ic">✩</span>Gebruikers</a>
+      <a data-route="/policies"><span class="ic">☰</span>Policies &amp; groepen</a>
+      <a data-route="/domains"><span class="ic">⌖</span>Domeinen</a>
+      <a data-route="/categories"><span class="ic">▣</span>Categorieen</a>
+      <a data-route="/phrases"><span class="ic">¶</span>Weighted phrases</a>
+      <a data-route="/dlp"><span class="ic">⛈</span>DLP</a>
+      <a data-route="/services"><span class="ic">⚡</span>Services</a>
+      <a data-route="/settings"><span class="ic">⚙</span>Instellingen</a>
+      <a data-route="/test"><span class="ic">▶</span>Policy test</a>
+      <a data-route="/files"><span class="ic">☲</span>Bestanden</a>
+    </nav>
+    <div class="side-foot">
+      <button class="btn" id="theme-toggle">Thema wisselen</button>
+      <small>Copyright &copy; 2026<br>Youness Banali El Khattabi</small>
+    </div>
+  </aside>
+  <main class="content">
+    <header class="topbar">
+      <button class="hamburger" id="hamburger" aria-label="Menu">☰</button>
+      <div class="page-title">
+        <h1 id="page-title">Dashboard</h1>
+        <p class="hint" id="page-sub"></p>
+      </div>
+      <div class="topbar-actions">
+        <button class="btn" id="reload-btn">Config herladen</button>
+        <a class="btn" href="/login">Uitloggen</a>
+      </div>
+    </header>
+    <section id="view" class="view"></section>
+    <footer class="page-footer">
+      <span>Copyright &copy; 2026 Youness Banali El Khattabi</span>
+      <span id="status-foot"></span>
+    </footer>
+  </main>
+  <div id="toast" class="toast" hidden></div>
+  <script>__DASHBOARD_JS__</script>
+</body>
+</html>"""
+
+
+DASHBOARD_CSS = r"""
 :root {
-  color-scheme: light dark;
-  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  background: #eef2f5;
-  color: #17202a;
+  --bg: #f4f6fb;
+  --surface: #ffffff;
+  --surface-2: #f8fafc;
+  --surface-3: #eef2f7;
+  --border: #d8dee8;
+  --text: #0f172a;
+  --text-muted: #5a6677;
+  --primary: #1f3a8a;
+  --primary-2: #2451c7;
+  --primary-text: #ffffff;
+  --ok: #168251;
+  --ok-bg: #e6f4ec;
+  --warn: #b7791f;
+  --warn-bg: #fff4d6;
+  --danger: #b42318;
+  --danger-bg: #fdecea;
+  --info: #0f4f76;
+  --info-bg: #e7f1f7;
+  --shadow: 0 18px 48px rgba(13, 27, 64, 0.10);
+  --radius: 10px;
+  --radius-sm: 6px;
+  --font: 'Inter', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  color-scheme: light;
+  font-family: var(--font);
 }
+
+html[data-theme="dark"] {
+  --bg: #0c111a;
+  --surface: #161e2c;
+  --surface-2: #1a2333;
+  --surface-3: #20293c;
+  --border: #2c3a55;
+  --text: #e8eef7;
+  --text-muted: #98a4ba;
+  --primary: #5b8def;
+  --primary-2: #88aaff;
+  --primary-text: #0c111a;
+  --ok: #5ed6a1;
+  --ok-bg: #103626;
+  --warn: #f5c969;
+  --warn-bg: #3a2c0c;
+  --danger: #ff8a7d;
+  --danger-bg: #3a1612;
+  --info: #9bd7ff;
+  --info-bg: #122b3c;
+  --shadow: 0 24px 56px rgba(0, 0, 0, 0.5);
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  html[data-theme="auto"] {
+    --bg: #0c111a;
+    --surface: #161e2c;
+    --surface-2: #1a2333;
+    --surface-3: #20293c;
+    --border: #2c3a55;
+    --text: #e8eef7;
+    --text-muted: #98a4ba;
+    --primary: #5b8def;
+    --primary-2: #88aaff;
+    --primary-text: #0c111a;
+    --ok: #5ed6a1;
+    --ok-bg: #103626;
+    --warn: #f5c969;
+    --warn-bg: #3a2c0c;
+    --danger: #ff8a7d;
+    --danger-bg: #3a1612;
+    --info: #9bd7ff;
+    --info-bg: #122b3c;
+    --shadow: 0 24px 56px rgba(0, 0, 0, 0.5);
+    color-scheme: dark;
+  }
+}
+
 * { box-sizing: border-box; }
-body { margin: 0; min-height: 100vh; background: #eef2f5; color: #17202a; }
-body.centered { display: grid; place-items: center; }
-header {
-  position: sticky; top: 0; z-index: 2;
-  display: flex; align-items: center; justify-content: space-between; gap: 20px;
-  padding: 14px 22px; background: #ffffff; border-bottom: 1px solid #d8dee6;
-}
-h1 { margin: 0; font-size: 20px; letter-spacing: 0; }
-h2 { margin: 0 0 12px; font-size: 16px; letter-spacing: 0; }
-nav { display: flex; gap: 8px; flex-wrap: wrap; }
-a, button, .button {
-  color: #0f4f76; background: #e7f1f7; border: 1px solid #b9d1df; border-radius: 6px;
-  text-decoration: none; padding: 8px 10px; font: inherit; cursor: pointer;
-}
-button:hover, a:hover, .button:hover { background: #d7eaf5; }
-main { width: min(1400px, calc(100vw - 28px)); margin: 18px auto; }
-.grid { display: grid; grid-template-columns: minmax(320px, 0.9fr) minmax(360px, 1.1fr); gap: 16px; margin-top: 16px; }
-.panel, .login {
-  background: #ffffff; border: 1px solid #d8dee6; border-radius: 8px; padding: 16px;
-  box-shadow: 0 14px 30px rgba(15, 23, 42, .07);
-}
-.panel-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-pre {
-  overflow: auto; max-height: 62vh; margin: 0; padding: 12px; border-radius: 6px;
-  background: #15202b; color: #e9f1f7; font-size: 13px; line-height: 1.45;
-}
-.file { display: flex; justify-content: space-between; gap: 12px; margin: 7px 0; background: #f7fafc; color: #17202a; border-color: #d8dee6; }
-.file span { color: #64748b; }
-.event { border: 1px solid #d8dee6; border-left-width: 5px; border-radius: 6px; padding: 9px; margin: 7px 0; background: #f7fafc; }
-.event.block { border-left-color: #b42318; }
-.event.allow { border-left-color: #168251; }
-.event span { display: block; color: #536173; margin-top: 3px; word-break: break-word; }
-.editor textarea {
-  width: 100%; height: calc(100vh - 150px); resize: vertical; border: 1px solid #b9c4d0; border-radius: 8px;
-  padding: 12px; background: #101820; color: #f4f7fb; font: 13px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace;
-}
-.actions { display: flex; gap: 10px; margin-top: 10px; }
-.login { width: min(440px, calc(100vw - 28px)); }
-label { display: grid; gap: 6px; font-weight: 700; color: #334155; }
-.check { display: flex; align-items: center; gap: 8px; }
-.check input { width: auto; }
-input, textarea, select {
-  width: 100%; border: 1px solid #b9c4d0; border-radius: 6px; padding: 10px;
-  font: inherit; background: #fff; color: #17202a;
-}
-.login form, .test-grid { display: grid; gap: 12px; }
-.test-grid { grid-template-columns: repeat(2, minmax(220px, 1fr)); }
-.wide { grid-column: 1 / -1; }
-.test-grid textarea { height: 160px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
-.error { color: #b42318; font-weight: 700; }
-.summary-grid {
-  display: grid;
-  grid-template-columns: repeat(6, minmax(130px, 1fr));
-  gap: 12px;
-  margin-bottom: 16px;
-}
-.stat {
-  min-height: 86px;
-  display: grid;
-  align-content: center;
-  gap: 4px;
-  background: #ffffff;
-  border: 1px solid #d8dee6;
-  border-radius: 8px;
-  padding: 14px;
-  box-shadow: 0 10px 22px rgba(15, 23, 42, .05);
-}
-.stat span { color: #64748b; font-size: 13px; font-weight: 750; }
-.stat b { font-size: 27px; letter-spacing: 0; }
-.admin-grid {
-  display: grid;
-  grid-template-columns: minmax(360px, 1fr) minmax(360px, 1fr);
-  gap: 16px;
-}
-.wide-panel { grid-column: 1 / -1; }
-.hint { color: #64748b; margin: 4px 0 0; line-height: 1.45; }
-.toolbar {
-  display: grid;
-  grid-template-columns: minmax(180px, 260px) minmax(260px, 1fr);
-  gap: 12px;
-  margin: 14px 0;
-}
-.inline-form {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(180px, 1fr));
-  gap: 12px;
-  align-items: end;
-}
-.inline-form button { min-height: 42px; }
-.category-list {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(320px, 1fr));
-  gap: 10px;
-}
-.category-item {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 12px;
-  align-items: center;
-  min-height: 92px;
-  padding: 12px;
-  border: 1px solid #d8dee6;
-  border-left-width: 5px;
-  border-radius: 8px;
-  background: #f8fafc;
-}
-.category-item.active { background: #eef9f3; border-color: #9fcfb7; border-left-color: #168251; }
-.category-item.risk-critical.active, .category-item.risk-high.active { background: #fff4f2; border-color: #e6a39a; border-left-color: #b42318; }
-.category-item.risk-medium.active { background: #fff8e6; border-color: #e0bd57; border-left-color: #b7791f; }
-.category-copy { min-width: 0; display: grid; gap: 4px; }
-.category-copy b { font-size: 15px; }
-.category-copy span, .category-copy em { color: #64748b; font-size: 13px; line-height: 1.35; }
-.category-copy em { color: #168251; font-style: normal; font-weight: 750; }
-.row-actions {
-  display: grid;
-  grid-template-columns: 88px 1fr;
-  gap: 8px;
-  align-items: center;
-  min-width: 260px;
-}
-.row-actions .danger-btn { grid-column: 2; }
-.threshold-input { text-align: center; }
-.danger-btn {
-  color: #9f1d13;
-  background: #fff0ee;
-  border-color: #e6a39a;
-}
-.danger-btn:hover { background: #ffe2de; }
-.list-stack { display: grid; gap: 8px; margin-top: 12px; }
-.list-row {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 12px;
-  min-height: 56px;
-  padding: 10px;
-  border: 1px solid #d8dee6;
-  border-radius: 8px;
-  background: #f8fafc;
-}
-.list-row div { min-width: 0; }
-.list-row span { display: block; margin-top: 3px; color: #64748b; font-size: 13px; word-break: break-word; }
-.list-row.compact { min-height: 44px; }
-.events-grid { display: grid; grid-template-columns: repeat(2, minmax(260px, 1fr)); gap: 8px; }
-.spaced { margin-top: 18px; }
-.toast {
-  position: fixed;
-  right: 18px;
-  bottom: 18px;
-  max-width: min(460px, calc(100vw - 36px));
-  padding: 12px 14px;
-  border-radius: 8px;
-  border: 1px solid #b9d1df;
-  background: #ffffff;
-  box-shadow: 0 16px 40px rgba(15, 23, 42, .18);
-  font-weight: 750;
+html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--text); font-family: var(--font); -webkit-font-smoothing: antialiased; }
+body { display: grid; grid-template-columns: 260px 1fr; min-height: 100vh; }
+a { color: inherit; text-decoration: none; }
+
+/* SIDEBAR */
+.sidebar {
+  position: sticky; top: 0; align-self: start;
+  width: 260px; height: 100vh;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; gap: 18px;
+  padding: 18px 14px;
   z-index: 10;
 }
-.toast.ok { border-color: #8bc2a8; color: #11643d; }
-.toast.error { border-color: #e6a39a; color: #9f1d13; }
-@media (max-width: 800px) {
-  header { align-items: flex-start; flex-direction: column; }
-  .grid, .test-grid, .admin-grid, .summary-grid, .category-list, .toolbar, .inline-form, .events-grid { grid-template-columns: 1fr; }
-  .wide-panel { grid-column: auto; }
-  .category-item { grid-template-columns: 1fr; }
-  .row-actions { min-width: 0; grid-template-columns: 88px 1fr; }
+.brand { display: flex; align-items: center; gap: 10px; }
+.brand-mark {
+  width: 38px; height: 38px; border-radius: 9px;
+  background: linear-gradient(135deg, var(--primary), var(--primary-2));
+  color: var(--primary-text); display: grid; place-items: center;
+  font-weight: 800; letter-spacing: -0.5px; font-size: 14px;
 }
-@media (prefers-color-scheme: dark) {
-  :root, body { background: #10141b; color: #e9eef5; }
-  header, .panel, .login { background: #19212b; border-color: #344052; }
-  a, button, .button { background: #253445; border-color: #456073; color: #bde7ff; }
-  a:hover, button:hover, .button:hover { background: #304357; }
-  label { color: #c3cedb; }
-  input, textarea, select { background: #101820; color: #f4f7fb; border-color: #465568; }
-  .file, .event, .stat, .category-item, .list-row, .toast { background: #202a36; color: #e9eef5; border-color: #344052; }
-  .file span, .event span, .hint, .stat span, .category-copy span, .list-row span { color: #aab7c6; }
-  .category-item.active { background: #102b22; border-color: #2f7756; }
-  .category-item.risk-critical.active, .category-item.risk-high.active { background: #3a1715; border-color: #7f2a23; }
-  .category-item.risk-medium.active { background: #33270c; border-color: #745b16; }
-  .danger-btn { background: #3a1715; border-color: #7f2a23; color: #ffb4aa; }
+.brand-text strong { display: block; font-size: 14px; }
+.brand-text small { color: var(--text-muted); font-size: 11px; }
+
+.side-nav { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; }
+.side-nav a {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 11px; border-radius: 8px;
+  color: var(--text-muted); font-weight: 600; font-size: 14px;
+  cursor: pointer; transition: background 0.15s, color 0.15s;
+}
+.side-nav a:hover { background: var(--surface-2); color: var(--text); }
+.side-nav a.active { background: var(--surface-3); color: var(--text); }
+.side-nav a.active .ic { color: var(--primary); }
+.side-nav .ic {
+  width: 22px; height: 22px; display: inline-grid; place-items: center;
+  border-radius: 6px; font-size: 13px; color: var(--text-muted);
+  background: var(--surface-2);
+}
+.side-foot { margin-top: auto; display: grid; gap: 10px; }
+.side-foot small { color: var(--text-muted); font-size: 11px; line-height: 1.5; }
+
+/* CONTENT */
+.content { display: flex; flex-direction: column; min-width: 0; }
+.topbar {
+  position: sticky; top: 0; z-index: 5;
+  display: flex; align-items: center; gap: 16px;
+  padding: 14px 22px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+.topbar .page-title { flex: 1; min-width: 0; }
+.topbar h1 { margin: 0; font-size: 18px; font-weight: 700; letter-spacing: -0.2px; }
+.topbar .hint { margin: 1px 0 0; font-size: 12px; color: var(--text-muted); }
+.topbar-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.hamburger { display: none; }
+
+.view { padding: 22px; display: flex; flex-direction: column; gap: 18px; flex: 1; }
+
+/* BUTTONS */
+.btn, button.btn, button[type="submit"], a.btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 8px 14px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border); background: var(--surface-2); color: var(--text);
+  font: 600 13px var(--font); cursor: pointer; transition: background 0.15s, border-color 0.15s, transform 0.05s;
+}
+.btn:hover, button[type="submit"]:hover { background: var(--surface-3); }
+.btn.primary, button.primary, button[type="submit"].primary {
+  background: var(--primary); border-color: var(--primary); color: var(--primary-text);
+}
+.btn.primary:hover, button.primary:hover { background: var(--primary-2); border-color: var(--primary-2); }
+.btn.danger, .danger-btn {
+  background: var(--danger-bg); border-color: var(--danger); color: var(--danger);
+}
+.btn.danger:hover, .danger-btn:hover { filter: brightness(0.95); }
+.btn.ghost { background: transparent; }
+.btn:active { transform: translateY(1px); }
+.btn:disabled { opacity: 0.55; cursor: not-allowed; }
+
+/* PANELS */
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px;
+  box-shadow: var(--shadow);
+  display: flex; flex-direction: column; gap: 12px;
+  min-width: 0;
+}
+.panel h2, .panel-head h2 { margin: 0; font-size: 15px; font-weight: 700; }
+.panel-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+.panel-head .hint { margin: 4px 0 0; }
+.hint { color: var(--text-muted); font-size: 13px; line-height: 1.45; margin: 0; }
+
+/* GRID HELPERS */
+.grid { display: grid; gap: 14px; }
+.grid.cards-6 { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+.grid.cards-4 { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+.grid.cards-3 { grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); }
+.grid.cards-2 { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+.grid.list { grid-template-columns: 1fr; gap: 8px; }
+.grid.two-cols { grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); }
+
+/* CARDS */
+.kpi {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  display: flex; flex-direction: column; gap: 4px;
+  position: relative;
+  box-shadow: var(--shadow);
+}
+.kpi .label { color: var(--text-muted); font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
+.kpi .value { font-size: 26px; font-weight: 700; letter-spacing: -0.3px; }
+.kpi .sub { color: var(--text-muted); font-size: 12px; }
+.kpi.ok { border-left: 4px solid var(--ok); }
+.kpi.danger { border-left: 4px solid var(--danger); }
+.kpi.warn { border-left: 4px solid var(--warn); }
+.kpi.info { border-left: 4px solid var(--primary); }
+
+/* BADGES */
+.badge {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 9px; border-radius: 999px;
+  font-size: 12px; font-weight: 700; letter-spacing: 0.02em;
+  border: 1px solid transparent; line-height: 1.6;
+}
+.badge.ok { background: var(--ok-bg); color: var(--ok); border-color: var(--ok); }
+.badge.danger { background: var(--danger-bg); color: var(--danger); border-color: var(--danger); }
+.badge.warn { background: var(--warn-bg); color: var(--warn); border-color: var(--warn); }
+.badge.info { background: var(--info-bg); color: var(--info); border-color: var(--info); }
+.badge.neutral { background: var(--surface-3); color: var(--text-muted); border-color: var(--border); }
+.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.dot.ok { background: var(--ok); }
+.dot.danger { background: var(--danger); }
+.dot.warn { background: var(--warn); }
+.dot.neutral { background: var(--text-muted); }
+
+/* TABLES */
+.table-wrap { width: 100%; overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius); }
+table.data { width: 100%; border-collapse: collapse; min-width: 600px; }
+table.data th, table.data td {
+  text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border);
+  font-size: 13px; vertical-align: top;
+}
+table.data th { background: var(--surface-2); font-weight: 700; color: var(--text-muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+table.data tbody tr:hover { background: var(--surface-2); }
+table.data tbody tr:last-child td { border-bottom: 0; }
+table.data td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+table.data td.right { text-align: right; }
+table.data td.actions { white-space: nowrap; text-align: right; }
+
+/* FORMS */
+.field { display: grid; gap: 5px; font-size: 13px; font-weight: 600; color: var(--text-muted); }
+.field input, .field select, .field textarea {
+  width: 100%; padding: 9px 11px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--surface-2); color: var(--text); font: 13px var(--font);
+}
+.field input:focus, .field select:focus, .field textarea:focus {
+  outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(91, 141, 239, 0.18);
+  background: var(--surface);
+}
+.field textarea { min-height: 110px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+form.row, form.inline-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; align-items: end; }
+form.row button, form.inline-form button { min-height: 38px; }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.check { display: inline-flex; align-items: center; gap: 8px; font-weight: 600; cursor: pointer; }
+.check input { width: 18px; height: 18px; }
+
+/* LOGIN */
+.login-body {
+  display: grid; place-items: center; min-height: 100vh; padding: 24px;
+  background: linear-gradient(155deg, rgba(31,58,138,0.18), rgba(36,81,199,0.08));
+  grid-template-columns: 1fr;
+}
+.login-card {
+  width: min(420px, 100%);
+  background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+  padding: 28px; box-shadow: var(--shadow);
+  display: grid; gap: 18px;
+}
+.login-brand { display: flex; align-items: center; gap: 12px; }
+.login-brand h1 { margin: 0; font-size: 18px; }
+.login-brand p { margin: 2px 0 0; color: var(--text-muted); font-size: 12px; }
+.login-card form { display: grid; gap: 14px; }
+.login-footer { color: var(--text-muted); font-size: 11px; text-align: center; border-top: 1px solid var(--border); padding-top: 12px; }
+.error { background: var(--danger-bg); color: var(--danger); padding: 9px 12px; border-radius: 8px; border: 1px solid var(--danger); font-size: 13px; }
+
+/* EDITOR */
+.editor-panel { display: flex; flex-direction: column; gap: 12px; }
+.editor textarea {
+  width: 100%; min-height: 60vh; resize: vertical;
+  background: var(--surface-2); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 14px; font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.editor .actions { margin-top: 10px; }
+
+/* EVENT LIST */
+.event-row {
+  display: grid; grid-template-columns: 110px 1fr auto; gap: 12px;
+  align-items: center; padding: 10px 12px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+.event-row .ts { font-size: 12px; color: var(--text-muted); font-family: ui-monospace, monospace; }
+.event-row .meta { color: var(--text-muted); font-size: 12px; }
+.event-row .meta strong { color: var(--text); font-weight: 600; }
+.event-row .actions-col { display: flex; gap: 6px; }
+
+/* SETTINGS TOGGLE */
+.toggle { position: relative; display: inline-block; width: 42px; height: 24px; }
+.toggle input { opacity: 0; width: 0; height: 0; }
+.toggle .slider {
+  position: absolute; inset: 0; background: var(--border); border-radius: 24px;
+  transition: background 0.15s; cursor: pointer;
+}
+.toggle .slider:before {
+  content: ""; position: absolute; left: 3px; top: 3px;
+  width: 18px; height: 18px; border-radius: 50%; background: var(--surface);
+  transition: transform 0.15s; box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+}
+.toggle input:checked + .slider { background: var(--primary); }
+.toggle input:checked + .slider:before { transform: translateX(18px); }
+.setting-row {
+  display: grid; grid-template-columns: 1fr auto; gap: 14px; align-items: center;
+  padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2);
+}
+.setting-row .label { font-weight: 600; font-size: 14px; }
+.setting-row .sub { color: var(--text-muted); font-size: 12px; margin-top: 2px; }
+
+/* CHARTS */
+.chart-card { display: flex; flex-direction: column; gap: 10px; min-height: 200px; }
+.chart-card h3 { margin: 0; font-size: 13px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.04em; }
+.chart-card svg { width: 100%; height: 200px; overflow: visible; }
+.chart-card .legend { display: flex; gap: 12px; flex-wrap: wrap; font-size: 12px; color: var(--text-muted); }
+.bar-list { display: grid; gap: 8px; }
+.bar-list .bar-row { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(120px, 2fr) 40px; gap: 10px; align-items: center; font-size: 12px; }
+.bar-list .bar { background: var(--surface-3); border-radius: 4px; height: 14px; overflow: hidden; position: relative; }
+.bar-list .bar > div { height: 100%; background: linear-gradient(90deg, var(--primary), var(--primary-2)); border-radius: 4px; }
+.bar-list .label { color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bar-list .count { text-align: right; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+
+/* EMPTY STATES */
+.empty {
+  text-align: center; color: var(--text-muted); padding: 28px 18px;
+  border: 1px dashed var(--border); border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+.empty strong { display: block; font-size: 15px; color: var(--text); margin-bottom: 4px; }
+
+/* TOAST */
+.toast {
+  position: fixed; right: 18px; bottom: 18px; z-index: 99;
+  max-width: min(420px, calc(100vw - 36px));
+  padding: 12px 16px; border-radius: 10px;
+  background: var(--surface); color: var(--text);
+  border: 1px solid var(--border); box-shadow: var(--shadow);
+  font-weight: 600; font-size: 13px;
+}
+.toast.ok { border-color: var(--ok); color: var(--ok); }
+.toast.error { border-color: var(--danger); color: var(--danger); }
+
+/* FOOTER */
+.page-footer {
+  padding: 12px 22px; border-top: 1px solid var(--border);
+  display: flex; justify-content: space-between; gap: 12px;
+  color: var(--text-muted); font-size: 12px;
+  background: var(--surface);
+}
+
+/* DETAIL/PILLS */
+.pill-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.pill { background: var(--surface-3); color: var(--text); padding: 3px 9px; border-radius: 999px; font-size: 12px; font-weight: 600; border: 1px solid var(--border); }
+.kvlist { display: grid; grid-template-columns: 150px 1fr; gap: 6px 14px; font-size: 13px; }
+.kvlist dt { color: var(--text-muted); font-weight: 600; }
+.kvlist dd { margin: 0; word-break: break-word; }
+
+/* CATEGORY LIST */
+.category-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px; }
+.category-item {
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  border-left: 4px solid var(--border); padding: 12px;
+  display: grid; gap: 8px;
+}
+.category-item.active { border-left-color: var(--ok); background: var(--ok-bg); }
+.category-item.risk-high.active, .category-item.risk-critical.active { border-left-color: var(--danger); background: var(--danger-bg); }
+.category-item.risk-medium.active { border-left-color: var(--warn); background: var(--warn-bg); }
+.category-item .title { font-weight: 700; }
+.category-item .sub { color: var(--text-muted); font-size: 12px; }
+.category-item .row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.category-item .threshold-input { max-width: 80px; }
+
+/* RESPONSIVE */
+@media (max-width: 1100px) {
+  .grid.two-cols { grid-template-columns: 1fr; }
+}
+@media (max-width: 880px) {
+  body { grid-template-columns: 1fr; }
+  .sidebar {
+    position: fixed; left: -280px; top: 0; height: 100vh;
+    transition: left 0.25s; box-shadow: var(--shadow);
+  }
+  .sidebar.open { left: 0; }
+  .hamburger { display: inline-flex; }
 }
 """
 
+
+DASHBOARD_JS = r"""
+(function() {
+  'use strict';
+
+  const view = document.getElementById('view');
+  const sidebar = document.getElementById('sidebar');
+  const sideNav = document.getElementById('side-nav');
+  const pageTitle = document.getElementById('page-title');
+  const pageSub = document.getElementById('page-sub');
+  const toastEl = document.getElementById('toast');
+  let toastTimer = null;
+
+  const ROUTES = {
+    '/': renderHome,
+    '/home': renderHome,
+    '/users': renderUsers,
+    '/policies': renderPolicies,
+    '/domains': renderDomains,
+    '/categories': renderCategories,
+    '/phrases': renderPhrases,
+    '/dlp': renderDLP,
+    '/services': renderServices,
+    '/logs': renderLogs,
+    '/settings': renderSettings,
+    '/test': renderTest,
+    '/files': renderFiles,
+  };
+
+  const TITLES = {
+    '/home': ['Dashboard', 'Overzicht van het systeem'],
+    '/users': ['Gebruikers', 'NetBird- en lokale gebruikers'],
+    '/policies': ['Policies', 'Groepsbeleid en regels'],
+    '/domains': ['Domeinen', 'Blocklist en allowlist beheer'],
+    '/categories': ['Categorieen', 'Webfilter categorie thresholds'],
+    '/phrases': ['Weighted phrases', 'Beheer weighted phrase lists'],
+    '/dlp': ['Data Loss Prevention', 'DLP regels en gevoelige data'],
+    '/services': ['Services', 'Status van alle modules'],
+    '/logs': ['Logs en events', 'Geschiedenis van blocks en allows'],
+    '/settings': ['Instellingen', 'Master-toggles voor alle modules'],
+    '/test': ['Policy test', 'Test scan-flows zonder live verkeer'],
+    '/files': ['Bestanden', 'Geavanceerde bewerker voor config bestanden'],
+  };
+
+  // ---------- helpers ----------
+  function esc(value) {
+    return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+  function fmtTs(value) {
+    if (!value) return '';
+    try {
+      const d = new Date(value);
+      if (isNaN(d.getTime())) return value;
+      return d.toLocaleString('nl-BE', { year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit', second:'2-digit' });
+    } catch (_) { return value; }
+  }
+  function fmtNum(n) {
+    if (n === null || n === undefined) return '0';
+    return Number(n).toLocaleString('nl-BE');
+  }
+  function api(url, opts) {
+    return fetch(url, opts || {}).then(async (res) => {
+      const text = await res.text();
+      let data; try { data = text ? JSON.parse(text) : {}; } catch (_) { data = { error: text }; }
+      if (!res.ok) throw new Error(data.error || res.statusText);
+      return data;
+    });
+  }
+  function post(url, body) {
+    return api(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+  }
+  function toast(message, ok) {
+    if (!message) return;
+    toastEl.textContent = message;
+    toastEl.className = 'toast ' + (ok === false ? 'error' : 'ok');
+    toastEl.hidden = false;
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { toastEl.hidden = true; }, 3800);
+  }
+  function el(tag, attrs, ...children) {
+    const n = document.createElement(tag);
+    if (attrs) for (const k in attrs) {
+      if (k === 'class') n.className = attrs[k];
+      else if (k === 'html') n.innerHTML = attrs[k];
+      else if (k.startsWith('on') && typeof attrs[k] === 'function') n.addEventListener(k.slice(2), attrs[k]);
+      else n.setAttribute(k, attrs[k]);
+    }
+    for (const c of children) { if (c == null) continue; if (typeof c === 'string') n.appendChild(document.createTextNode(c)); else n.appendChild(c); }
+    return n;
+  }
+  function badge(label, kind) { return `<span class="badge ${kind || 'neutral'}">${esc(label)}</span>`; }
+  function emptyState(title, hint) {
+    return `<div class="empty"><strong>${esc(title)}</strong>${hint ? `<span>${esc(hint)}</span>` : ''}</div>`;
+  }
+  function svgBar(values, opts) {
+    opts = opts || {};
+    const width = opts.width || 600;
+    const height = opts.height || 200;
+    const pad = { l: 36, r: 12, t: 14, b: 28 };
+    const max = Math.max(1, ...values.flatMap(v => [v.allow || 0, v.block || 0]));
+    const barW = (width - pad.l - pad.r) / Math.max(1, values.length);
+    let bars = '';
+    values.forEach((v, i) => {
+      const x = pad.l + i * barW;
+      const aH = ((v.allow || 0) / max) * (height - pad.t - pad.b);
+      const bH = ((v.block || 0) / max) * (height - pad.t - pad.b);
+      const aY = height - pad.b - aH;
+      const bY = height - pad.b - bH;
+      const w = Math.max(2, barW - 6);
+      bars += `<rect x="${x + 1}" y="${aY}" width="${w/2}" height="${aH}" fill="var(--ok)" rx="2"/>`;
+      bars += `<rect x="${x + 1 + w/2}" y="${bY}" width="${w/2}" height="${bH}" fill="var(--danger)" rx="2"/>`;
+    });
+    const yLabels = [0, max * 0.5, max].map((y, idx) => {
+      const yy = height - pad.b - (y / max) * (height - pad.t - pad.b);
+      return `<text x="${pad.l - 6}" y="${yy + 3}" text-anchor="end" font-size="9" fill="var(--text-muted)">${fmtNum(Math.round(y))}</text>`;
+    }).join('');
+    const xLabels = values.length <= 12
+      ? values.map((v, i) => {
+        const x = pad.l + i * barW + barW/2;
+        const label = (v.bucket || '').slice(-5);
+        return `<text x="${x}" y="${height - 10}" text-anchor="middle" font-size="9" fill="var(--text-muted)">${esc(label)}</text>`;
+      }).join('')
+      : '';
+    return `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">${bars}${yLabels}${xLabels}</svg>`;
+  }
+  function svgDonut(allow, block) {
+    const total = (allow || 0) + (block || 0);
+    if (!total) return '<svg viewBox="0 0 120 120"><circle cx="60" cy="60" r="46" fill="none" stroke="var(--border)" stroke-width="14"/></svg>';
+    const aFrac = allow / total;
+    const c = 2 * Math.PI * 46;
+    const aLen = aFrac * c;
+    return `<svg viewBox="0 0 120 120">
+      <circle cx="60" cy="60" r="46" fill="none" stroke="var(--surface-3)" stroke-width="14"/>
+      <circle cx="60" cy="60" r="46" fill="none" stroke="var(--ok)" stroke-width="14" stroke-dasharray="${aLen} ${c - aLen}" transform="rotate(-90 60 60)"/>
+      <text x="60" y="58" text-anchor="middle" font-size="18" font-weight="700" fill="var(--text)">${Math.round(aFrac*100)}%</text>
+      <text x="60" y="74" text-anchor="middle" font-size="10" fill="var(--text-muted)">allowed</text>
+    </svg>`;
+  }
+  function barList(items, max) {
+    if (!items || !items.length) return emptyState('Geen data', 'Geen events om te tonen.');
+    const maxV = Math.max(1, ...items.map(i => i[1] || i.count || 0));
+    const rows = items.slice(0, max || 8).map(item => {
+      const label = item[0] || item.label || '?';
+      const val = item[1] || item.count || 0;
+      const pct = Math.round((val / maxV) * 100);
+      return `<div class="bar-row">
+        <span class="label" title="${esc(label)}">${esc(label)}</span>
+        <span class="bar"><div style="width: ${pct}%"></div></span>
+        <span class="count">${fmtNum(val)}</span>
+      </div>`;
+    }).join('');
+    return `<div class="bar-list">${rows}</div>`;
+  }
+
+  // ---------- router ----------
+  function setActiveLink(path) {
+    sideNav.querySelectorAll('a').forEach(a => {
+      a.classList.toggle('active', a.dataset.route === path);
+    });
+    const t = TITLES[path] || TITLES['/home'];
+    pageTitle.textContent = t[0];
+    pageSub.textContent = t[1];
+  }
+  function navigate(path, replace) {
+    if (!ROUTES[path]) {
+      // try matching dynamic /users/:id
+      if (path.startsWith('/users/')) {
+        const id = decodeURIComponent(path.slice('/users/'.length));
+        if (replace) history.replaceState({}, '', path); else history.pushState({}, '', path);
+        sidebar.classList.remove('open');
+        setActiveLink('/users');
+        return renderUserDetail(id);
+      }
+      path = '/home';
+    }
+    if (replace) history.replaceState({}, '', path); else history.pushState({}, '', path);
+    sidebar.classList.remove('open');
+    setActiveLink(path);
+    view.innerHTML = '<div class="empty">Laden…</div>';
+    ROUTES[path]().catch(err => {
+      view.innerHTML = `<div class="empty error"><strong>Fout</strong><span>${esc(err.message || err)}</span></div>`;
+    });
+  }
+
+  sideNav.addEventListener('click', (ev) => {
+    const a = ev.target.closest('a[data-route]');
+    if (!a) return;
+    ev.preventDefault();
+    navigate(a.dataset.route);
+  });
+  window.addEventListener('popstate', () => navigate(location.pathname, true));
+
+  document.getElementById('hamburger').addEventListener('click', () => sidebar.classList.toggle('open'));
+  document.getElementById('reload-btn').addEventListener('click', async () => {
+    try { await post('/api/reload', {}); toast('Configuratie herladen', true); navigate(location.pathname, true); }
+    catch (e) { toast(e.message, false); }
+  });
+  document.getElementById('theme-toggle').addEventListener('click', () => {
+    const cur = document.documentElement.getAttribute('data-theme') || 'auto';
+    const next = cur === 'dark' ? 'light' : (cur === 'light' ? 'auto' : 'dark');
+    document.documentElement.setAttribute('data-theme', next);
+    try { localStorage.setItem('sig-theme', next); } catch (_) {}
+    toast('Thema: ' + next, true);
+  });
+  try { const t = localStorage.getItem('sig-theme'); if (t) document.documentElement.setAttribute('data-theme', t); } catch (_) {}
+
+  // ---------- VIEW: HOME ----------
+  async function renderHome() {
+    const data = await api('/api/home');
+    const s = data.summary || {};
+    const charts = data.charts || {};
+    const services = data.services || [];
+    const recent = data.recent_events || [];
+    const blocks = data.recent_blocks || [];
+
+    const kpis = [
+      { label: 'Gebruikers', value: fmtNum(s.users), sub: `${fmtNum(s.netbird_ips || 0)} NetBird IPs`, kind: 'info' },
+      { label: 'Policies', value: fmtNum(s.groups), sub: 'Groepen', kind: 'info' },
+      { label: 'Geblokkeerde domeinen', value: fmtNum(s.blocked_domains), sub: 'in blocklist', kind: 'danger' },
+      { label: 'Categorieen', value: fmtNum(s.categories), sub: `${fmtNum(s.active_category_blocks || 0)} actief`, kind: 'info' },
+      { label: 'DLP regels', value: fmtNum(s.dlp_rules), sub: 'totaal geladen', kind: 'warn' },
+      { label: 'Events totaal', value: fmtNum(s.events_total || s.events || 0), sub: `${fmtNum(s.block_events || 0)} blocks`, kind: s.block_events ? 'danger' : 'ok' },
+    ];
+    if (s.weighted_phrases_enabled) {
+      kpis.push({ label: 'Weighted phrases', value: fmtNum(s.phrases_rules || 0), sub: 'actieve regels', kind: 'warn' });
+    }
+
+    const kpiHtml = kpis.map(k => `
+      <div class="kpi ${k.kind}">
+        <span class="label">${esc(k.label)}</span>
+        <span class="value">${esc(k.value)}</span>
+        <span class="sub">${esc(k.sub)}</span>
+      </div>`).join('');
+
+    const servicesHtml = services.map(svc => `
+      <div class="setting-row">
+        <div>
+          <div class="label">${esc(svc.label)}</div>
+          <div class="sub">${esc(svc.detail || '')}</div>
+        </div>
+        <div>${badge(svc.status, svc.status === 'running' ? 'ok' : (svc.status === 'disabled' ? 'neutral' : 'danger'))}</div>
+      </div>`).join('') || emptyState('Geen services', '');
+
+    const blocksHtml = blocks.length ? blocks.map(e => `
+      <tr>
+        <td class="mono">${esc((e.ts || '').slice(11, 19))}</td>
+        <td><strong>${esc(e.user || 'anoniem')}</strong><br><span class="hint">${esc(e.source_ip || '')}</span></td>
+        <td><strong>${esc(e.domain || '')}</strong><br><span class="hint">${esc(e.reason || '')}</span></td>
+        <td>${badge(e.action, e.action === 'block' ? 'danger' : 'ok')}</td>
+      </tr>`).join('') : `<tr><td colspan="4">${emptyState('Geen blocks geregistreerd', 'Nog geen activity sinds start.')}</td></tr>`;
+
+    view.innerHTML = `
+      <section class="grid cards-6">${kpiHtml}</section>
+      <section class="grid cards-2">
+        <div class="panel chart-card">
+          <h3>Allowed vs blocked</h3>
+          <div style="display: flex; gap: 18px; align-items: center;">
+            <div style="width: 160px; height: 160px;">${svgDonut(charts.totals?.allow || 0, charts.totals?.block || 0)}</div>
+            <div class="kvlist">
+              <dt>Toegelaten</dt><dd>${fmtNum(charts.totals?.allow || 0)}</dd>
+              <dt>Geblokkeerd</dt><dd>${fmtNum(charts.totals?.block || 0)}</dd>
+              <dt>Totaal</dt><dd>${fmtNum((charts.totals?.allow || 0) + (charts.totals?.block || 0))}</dd>
+            </div>
+          </div>
+        </div>
+        <div class="panel chart-card">
+          <h3>Blocks per dag (30d)</h3>
+          ${charts.daily && charts.daily.length ? svgBar(charts.daily) : emptyState('Geen trafficdata beschikbaar', '')}
+          <div class="legend"><span><span class="dot ok"></span> Allow</span><span><span class="dot danger"></span> Block</span></div>
+        </div>
+      </section>
+      <section class="grid cards-3">
+        <div class="panel"><h2>Top geblokkeerde categorieen</h2>${barList(charts.top_categories, 8)}</div>
+        <div class="panel"><h2>Meest actieve gebruikers</h2>${barList(charts.top_users, 8)}</div>
+        <div class="panel"><h2>Top geblokkeerde domeinen</h2>${barList(charts.top_domains, 8)}</div>
+      </section>
+      <section class="grid two-cols">
+        <div class="panel">
+          <header class="panel-head"><h2>Service status</h2></header>
+          <div class="grid list">${servicesHtml}</div>
+        </div>
+        <div class="panel">
+          <header class="panel-head">
+            <div>
+              <h2>Laatste blocks</h2>
+              <p class="hint">Snelle blik op de meest recente block-events.</p>
+            </div>
+            <a class="btn" data-route="/logs" href="/logs">Alle logs</a>
+          </header>
+          <div class="table-wrap">
+            <table class="data">
+              <thead><tr><th>Tijd</th><th>Gebruiker</th><th>Domein</th><th>Status</th></tr></thead>
+              <tbody>${blocksHtml}</tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+      <section class="grid cards-3">
+        <div class="panel">
+          <h2>Snelle acties</h2>
+          <div class="actions">
+            <a class="btn primary" data-route="/users" href="/users">Gebruikers</a>
+            <a class="btn" data-route="/domains" href="/domains">Domeinen</a>
+            <a class="btn" data-route="/policies" href="/policies">Policies</a>
+            <a class="btn" data-route="/settings" href="/settings">Instellingen</a>
+          </div>
+        </div>
+      </section>
+    `;
+    bindRouteLinks();
+  }
+
+  // ---------- VIEW: USERS ----------
+  async function renderUsers() {
+    const data = await api('/api/policy');
+    const users = data.users || {};
+    const ipMap = data.ip_map || {};
+    const ipByUser = {};
+    Object.entries(ipMap).forEach(([ip, mapping]) => {
+      const u = (typeof mapping === 'string') ? mapping : (mapping && mapping.user);
+      if (!u) return;
+      (ipByUser[u] = ipByUser[u] || []).push(ip);
+    });
+
+    const rows = Object.entries(users).map(([user, obj]) => {
+      const groups = (obj.groups || []).map(g => `<span class="pill">${esc(g)}</span>`).join(' ');
+      const ips = (ipByUser[user] || []).map(ip => `<span class="pill">${esc(ip)}</span>`).join(' ');
+      return `<tr>
+        <td><strong>${esc(user)}</strong></td>
+        <td class="mono">${esc(obj.netbird_user_id || obj.entra_object_id || '')}</td>
+        <td><div class="pill-row">${groups || '<span class="hint">geen</span>'}</div></td>
+        <td><div class="pill-row">${ips || '<span class="hint">geen</span>'}</div></td>
+        <td class="actions">
+          <a class="btn" href="/users/${encodeURIComponent(user)}" data-route="/users/${encodeURIComponent(user)}">Details</a>
+          <button class="btn danger" data-action="user-delete" data-user="${esc(user)}">Verwijder</button>
+        </td>
+      </tr>`;
+    }).join('');
+
+    view.innerHTML = `
+      <section class="panel">
+        <header class="panel-head">
+          <div>
+            <h2>Gebruikers</h2>
+            <p class="hint">NetBird sync vult deze lijst automatisch. Voeg hier ook lokale gebruikers toe of pas groepen aan.</p>
+          </div>
+        </header>
+        <form id="user-form" class="row">
+          <label class="field"><span>Gebruiker</span><input name="user" placeholder="naam@school.be" required></label>
+          <label class="field"><span>Groepen</span><input name="groups" placeholder="teacher, byod"></label>
+          <label class="field"><span>NetBird IP</span><input name="ip" placeholder="100.64.x.x"></label>
+          <label class="field"><span>Entra object id</span><input name="entra_object_id" placeholder="optioneel"></label>
+          <button type="submit" class="primary">Opslaan</button>
+        </form>
+      </section>
+      <section class="panel">
+        <header class="panel-head"><h2>${fmtNum(Object.keys(users).length)} gebruikers</h2></header>
+        <input id="user-search" class="field" placeholder="Zoek op naam, email, groep, IP" style="padding: 9px 11px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text); width: 100%;">
+        <div class="table-wrap">
+          <table class="data">
+            <thead><tr><th>Gebruiker</th><th>ID</th><th>Groepen</th><th>IP / NetBird</th><th></th></tr></thead>
+            <tbody id="user-tbody">${rows || `<tr><td colspan="5">${emptyState('Geen gebruikers gevonden', 'Voer een NetBird sync uit of voeg er hieronder een toe.')}</td></tr>`}</tbody>
+          </table>
+        </div>
+      </section>
+    `;
+    bindRouteLinks();
+    document.getElementById('user-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const fd = Object.fromEntries(new FormData(ev.target).entries());
+      try { await post('/api/users/manage', { ...fd, action: 'save' }); toast('Gebruiker opgeslagen', true); navigate('/users', true); }
+      catch (e) { toast(e.message, false); }
+    });
+    view.querySelectorAll('[data-action="user-delete"]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        if (!confirm('Gebruiker ' + btn.dataset.user + ' verwijderen?')) return;
+        try { await post('/api/users/manage', { user: btn.dataset.user, action: 'delete' }); toast('Verwijderd', true); navigate('/users', true); }
+        catch (e) { toast(e.message, false); }
+      });
+    });
+    const search = document.getElementById('user-search');
+    if (search) {
+      search.addEventListener('input', () => {
+        const q = search.value.toLowerCase();
+        view.querySelectorAll('#user-tbody tr').forEach(tr => {
+          tr.style.display = tr.textContent.toLowerCase().includes(q) ? '' : 'none';
+        });
+      });
+    }
+  }
+
+  async function renderUserDetail(userId) {
+    view.innerHTML = '<div class="empty">Laden…</div>';
+    const data = await api('/api/user?id=' + encodeURIComponent(userId));
+    const stats = data.stats || {};
+    const ips = (data.ips || []).map(ip => `<span class="pill">${esc(ip.ip)} (${(ip.groups||[]).join(', ') || 'geen groep'})</span>`).join(' ') || '<span class="hint">geen IPs</span>';
+    const groups = (data.groups || []).map(g => `<span class="pill">${esc(g)}</span>`).join(' ') || '<span class="hint">geen groepen</span>';
+    const policies = Object.keys(data.policies || {});
+    const recent = (data.recent_events || []).map(e => `
+      <tr>
+        <td class="mono">${esc((e.ts || '').slice(0, 19).replace('T', ' '))}</td>
+        <td>${badge(e.action, e.action === 'block' ? 'danger' : 'ok')}</td>
+        <td><strong>${esc(e.domain || '')}</strong><br><span class="hint">${esc(e.url || '')}</span></td>
+        <td>${esc(e.reason || '')}</td>
+        <td>${esc((e.details && e.details.category) || '')}</td>
+        <td>${esc(e.policy || '')}</td>
+      </tr>`).join('');
+
+    view.innerHTML = `
+      <section class="panel">
+        <header class="panel-head">
+          <div>
+            <h2>${esc(data.user)}</h2>
+            <p class="hint">${esc(data.name || '')}${data.email ? ' · ' + esc(data.email) : ''}</p>
+          </div>
+          <div><a class="btn" data-route="/users" href="/users">Terug naar gebruikerslijst</a></div>
+        </header>
+        <dl class="kvlist">
+          <dt>Groepen</dt><dd><div class="pill-row">${groups}</div></dd>
+          <dt>IP-adressen</dt><dd><div class="pill-row">${ips}</div></dd>
+          <dt>Toegepaste policies</dt><dd>${policies.length ? policies.map(p => `<span class="pill">${esc(p)}</span>`).join(' ') : '<span class="hint">enkel common policy</span>'}</dd>
+          <dt>NetBird user id</dt><dd class="mono">${esc(data.netbird_user_id || '-')}</dd>
+          <dt>NetBird peers</dt><dd>${(data.netbird_peer_ids || []).join(', ') || '<span class="hint">-</span>'}</dd>
+          <dt>NetBird hostnames</dt><dd>${(data.netbird_hostnames || []).join(', ') || '<span class="hint">-</span>'}</dd>
+          <dt>Entra object id</dt><dd class="mono">${esc(data.entra_object_id || '-')}</dd>
+          <dt>Entra groups</dt><dd>${(data.entra_groups || []).join(', ') || '<span class="hint">-</span>'}</dd>
+        </dl>
+      </section>
+      <section class="grid cards-3">
+        <div class="kpi info"><span class="label">Totaal events</span><span class="value">${fmtNum(stats.total)}</span><span class="sub">in events.jsonl</span></div>
+        <div class="kpi ok"><span class="label">Toegelaten</span><span class="value">${fmtNum(stats.allowed)}</span><span class="sub">allows</span></div>
+        <div class="kpi danger"><span class="label">Geblokkeerd</span><span class="value">${fmtNum(stats.blocked)}</span><span class="sub">blocks</span></div>
+      </section>
+      <section class="grid cards-3">
+        <div class="panel"><h2>Top block-redenen</h2>${barList(stats.top_block_reasons, 8)}</div>
+        <div class="panel"><h2>Top geblokkeerde domeinen</h2>${barList(stats.top_blocked_domains, 8)}</div>
+        <div class="panel"><h2>Top categorieen</h2>${barList(stats.top_blocked_categories, 8)}</div>
+      </section>
+      <section class="panel">
+        <header class="panel-head"><h2>Recente events</h2><p class="hint">Maximaal 50 events. Volledige historiek in <a data-route="/logs" href="/logs">Logs</a>.</p></header>
+        <div class="table-wrap">
+          <table class="data">
+            <thead><tr><th>Tijd</th><th>Actie</th><th>Domein / URL</th><th>Reden</th><th>Categorie</th><th>Policy</th></tr></thead>
+            <tbody>${recent || `<tr><td colspan="6">${emptyState('Geen events voor deze gebruiker', '')}</td></tr>`}</tbody>
+          </table>
+        </div>
+      </section>
+    `;
+    bindRouteLinks();
+  }
+
+  // ---------- VIEW: POLICIES ----------
+  async function renderPolicies() {
+    const data = await api('/api/policy');
+    const groups = data.groups || [];
+    const policies = data.policies || {};
+    const rows = groups.map(group => {
+      const p = policies[group] || {};
+      const cats = Object.keys(p.phrase_thresholds || {}).length;
+      const blockedD = (p.blocked_domains || []).length;
+      const allowedD = (p.allowed_domains || []).length;
+      const mime = (p.blocked_mime_types || []).length;
+      return `<tr>
+        <td><strong>${esc(group)}</strong></td>
+        <td>${fmtNum(cats)}</td>
+        <td>${fmtNum(blockedD)}</td>
+        <td>${fmtNum(allowedD)}</td>
+        <td>${fmtNum(mime)}</td>
+        <td>${badge(p.dlp_enabled ? 'aan' : 'uit', p.dlp_enabled ? 'ok' : 'neutral')}</td>
+        <td>${badge(p.malware !== false ? 'aan' : 'uit', p.malware !== false ? 'ok' : 'neutral')}</td>
+        <td class="actions"><button class="btn danger" data-action="group-delete" data-group="${esc(group)}">Verwijder</button></td>
+      </tr>`;
+    }).join('') || `<tr><td colspan="8">${emptyState('Geen policies', 'NetBird sync of dashboard maakt groepen aan.')}</td></tr>`;
+
+    const common = policies.all || data.common_policy || {};
+    const commonRows = [
+      ['Malware scanning', common.malware !== false ? 'aan' : 'uit'],
+      ['DLP scanning', common.dlp_enabled !== false ? 'aan' : 'uit'],
+      ['Allow domains bypass content', common.allow_domains_bypass_content ? 'aan' : 'uit'],
+      ['Max body bytes', fmtNum(common.max_body_bytes)],
+      ['Geblokkeerde MIME types', (common.blocked_mime_types || []).length],
+      ['Allowed domains', (common.allowed_domains || []).length],
+      ['Blocked domains', (common.blocked_domains || []).length],
+      ['Hard blocked domains', (common.hard_blocked_domains || []).length],
+    ];
+
+    view.innerHTML = `
+      <section class="panel">
+        <header class="panel-head">
+          <div><h2>Common policy</h2><p class="hint">Geldt voor alle groepen. Allowlist heeft altijd prioriteit.</p></div>
+          <a class="btn" href="/edit?path=config.json">Bewerk volledige config</a>
+        </header>
+        <dl class="kvlist">${commonRows.map(r => `<dt>${esc(r[0])}</dt><dd>${esc(String(r[1]))}</dd>`).join('')}</dl>
+      </section>
+      <section class="panel">
+        <header class="panel-head">
+          <div><h2>Groepen / policies</h2><p class="hint">Maak hier eigen groepen aan of pas NetBird-groepen aan. Geen vaste basisgroepen meer.</p></div>
+        </header>
+        <form id="group-form" class="row">
+          <label class="field"><span>Nieuwe groep</span><input name="group" placeholder="staff, byod, guest"></label>
+          <label class="field"><span>Kopieer van</span>
+            <select name="copy_from">
+              <option value="common">Common policy</option>
+              ${groups.map(g => `<option value="${esc(g)}">${esc(g)}</option>`).join('')}
+            </select>
+          </label>
+          <button type="submit" class="primary">Groep maken</button>
+        </form>
+        <div class="table-wrap">
+          <table class="data">
+            <thead><tr><th>Groep</th><th>Categorieen</th><th>Blocks</th><th>Allowed</th><th>MIME</th><th>DLP</th><th>AV</th><th></th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+      </section>
+    `;
+    document.getElementById('group-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const fd = Object.fromEntries(new FormData(ev.target).entries());
+      try { await post('/api/policy/group', { ...fd, action: 'add' }); toast('Groep aangemaakt', true); navigate('/policies', true); }
+      catch (e) { toast(e.message, false); }
+    });
+    view.querySelectorAll('[data-action="group-delete"]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        if (!confirm('Groep ' + btn.dataset.group + ' verwijderen?')) return;
+        try { await post('/api/policy/group', { group: btn.dataset.group, action: 'delete' }); toast('Verwijderd', true); navigate('/policies', true); }
+        catch (e) { toast(e.message, false); }
+      });
+    });
+  }
+
+  // ---------- VIEW: DOMAINS ----------
+  async function renderDomains() {
+    const data = await api('/api/policy');
+    const groups = ['all', ...(data.groups || [])];
+    const rows = (data.domains || []).map(d => `
+      <tr data-search="${esc((d.domain + ' ' + d.label + ' ' + d.list).toLowerCase())}">
+        <td><strong>${esc(d.domain)}</strong></td>
+        <td>${esc(d.label)}</td>
+        <td>${badge(d.list === 'allowed_domains' ? 'allowlist' : (d.list === 'hard_blocked_domains' ? 'hard block' : 'block'),
+          d.list === 'allowed_domains' ? 'ok' : (d.list === 'hard_blocked_domains' ? 'danger' : 'warn'))}</td>
+        <td class="actions"><button class="btn danger" data-action="domain-remove" data-domain="${esc(d.domain)}" data-target="${esc(d.target)}" data-list="${esc(d.list)}">Verwijder</button></td>
+      </tr>`).join('') || `<tr><td colspan="4">${emptyState('Geen domeinregels', 'Voeg hieronder een regel toe.')}</td></tr>`;
+
+    view.innerHTML = `
+      <section class="panel">
+        <header class="panel-head">
+          <div>
+            <h2>Domeinbeheer</h2>
+            <p class="hint">Allowlist heeft <strong>altijd</strong> prioriteit boven blocklist en UT1-categorieen.</p>
+          </div>
+        </header>
+        <form id="domain-form" class="row">
+          <label class="field"><span>Voor</span>
+            <select name="target">${groups.map(g => `<option value="${esc(g)}">${esc(g === 'all' ? 'Alle groepen' : g)}</option>`).join('')}</select>
+          </label>
+          <label class="field"><span>Actie</span>
+            <select name="list">
+              <option value="blocked_domains">Blokkeren</option>
+              <option value="hard_blocked_domains">Hard block (alle groepen)</option>
+              <option value="allowed_domains">Toestaan (allowlist)</option>
+            </select>
+          </label>
+          <label class="field"><span>Domein</span><input name="domain" placeholder="example.com of *.example.com" required></label>
+          <button type="submit" class="primary">Toevoegen</button>
+        </form>
+      </section>
+      <section class="panel">
+        <header class="panel-head"><h2>Bestaande regels</h2></header>
+        <input id="domain-search" class="field" placeholder="Zoek domein, groep, type" style="padding: 9px 11px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text); width: 100%;">
+        <div class="table-wrap">
+          <table class="data">
+            <thead><tr><th>Domein</th><th>Groep</th><th>Type</th><th></th></tr></thead>
+            <tbody id="domain-tbody">${rows}</tbody>
+          </table>
+        </div>
+      </section>
+    `;
+    document.getElementById('domain-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const fd = Object.fromEntries(new FormData(ev.target).entries());
+      try { await post('/api/policy/domain', { ...fd, action: 'add' }); toast('Domeinregel toegevoegd', true); navigate('/domains', true); }
+      catch (e) { toast(e.message, false); }
+    });
+    view.querySelectorAll('[data-action="domain-remove"]').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        try { await post('/api/policy/domain', { domain: btn.dataset.domain, target: btn.dataset.target, list: btn.dataset.list, action: 'remove' }); toast('Verwijderd', true); navigate('/domains', true); }
+        catch (e) { toast(e.message, false); }
+      });
+    });
+    document.getElementById('domain-search').addEventListener('input', (ev) => {
+      const q = ev.target.value.toLowerCase();
+      view.querySelectorAll('#domain-tbody tr').forEach(tr => {
+        tr.style.display = (tr.dataset.search || '').includes(q) ? '' : 'none';
+      });
+    });
+  }
+
+  // ---------- VIEW: CATEGORIES ----------
+  async function renderCategories() {
+    const data = await api('/api/policy');
+    const groups = ['all', ...(data.groups || [])];
+    const settings = (await api('/api/settings')).settings || {};
+
+    function paint(targetGroup, search) {
+      const rows = (data.categories || []).filter(c => {
+        if (!search) return true;
+        const t = `${c.key} ${c.en} ${c.nl}`.toLowerCase();
+        return t.includes(search);
+      }).map(c => {
+        const direct = c.thresholds[targetGroup] !== null && c.thresholds[targetGroup] !== undefined;
+        const inherited = targetGroup !== 'all' && c.thresholds.all !== null && c.thresholds.all !== undefined;
+        const value = direct ? c.thresholds[targetGroup] : (c.default_threshold || 80);
+        const active = direct || inherited;
+        return `<div class="category-item ${active ? 'active' : ''} risk-${esc(c.risk)}" data-cat="${esc(c.key)}">
+          <div class="title">${esc(c.nl)} <span class="sub">${esc(c.en)} · ${esc(c.risk)}</span></div>
+          <div class="sub">${esc(c.phrase_rules || 0)} phrases${c.phrase_file ? '' : ' · nog geen phrase file'}</div>
+          ${inherited ? `<div class="sub"><span class="badge info">overge&euml;rfd van Alle groepen</span></div>` : ''}
+          <div class="row">
+            <input class="field threshold-input" type="number" min="1" max="999" value="${esc(value)}" style="max-width: 90px; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface); color: var(--text);">
+            <button class="btn primary" data-action="cat-on" data-key="${esc(c.key)}">Blokkeer / opslaan</button>
+            ${direct ? `<button class="btn danger" data-action="cat-off" data-key="${esc(c.key)}">Deblokkeer</button>` : ''}
+          </div>
+        </div>`;
+      }).join('') || emptyState('Geen categorieen', 'Pas je zoekterm aan.');
+      document.getElementById('cat-list').innerHTML = rows;
+      bindCatActions();
+    }
+    function bindCatActions() {
+      view.querySelectorAll('[data-action="cat-on"]').forEach(btn => btn.addEventListener('click', async () => {
+        const item = btn.closest('.category-item');
+        const threshold = item.querySelector('.threshold-input').value;
+        try {
+          await post('/api/policy/category', { target: document.getElementById('cat-group').value, category: btn.dataset.key, enabled: true, threshold });
+          toast('Categorie opgeslagen', true);
+          const updated = await api('/api/policy');
+          Object.assign(data, updated);
+          paint(document.getElementById('cat-group').value, document.getElementById('cat-search').value.toLowerCase());
+        } catch (e) { toast(e.message, false); }
+      }));
+      view.querySelectorAll('[data-action="cat-off"]').forEach(btn => btn.addEventListener('click', async () => {
+        try {
+          await post('/api/policy/category', { target: document.getElementById('cat-group').value, category: btn.dataset.key, enabled: false });
+          toast('Categorie gedeblokkeerd', true);
+          const updated = await api('/api/policy');
+          Object.assign(data, updated);
+          paint(document.getElementById('cat-group').value, document.getElementById('cat-search').value.toLowerCase());
+        } catch (e) { toast(e.message, false); }
+      }));
+    }
+
+    const phrasesNote = settings.weighted_phrases_enabled ? '' : `
+      <div class="empty">
+        <strong>Weighted phrases staan globaal UIT.</strong>
+        <span>Categorie thresholds zijn ingesteld, maar phrase-blocking is pas actief als je weighted phrases inschakelt via Instellingen.</span>
+      </div>`;
+
+    view.innerHTML = `
+      <section class="panel">
+        <header class="panel-head">
+          <div><h2>Categorieen</h2><p class="hint">UT1-style categorieen met threshold per groep. Allowlist overrulet altijd.</p></div>
+        </header>
+        ${phrasesNote}
+        <form class="row" onsubmit="return false;">
+          <label class="field"><span>Groep</span>
+            <select id="cat-group">${groups.map(g => `<option value="${esc(g)}">${esc(g === 'all' ? 'Alle groepen' : g)}</option>`).join('')}</select>
+          </label>
+          <label class="field"><span>Zoeken</span><input id="cat-search" placeholder="adult, malware, gokken..."></label>
+        </form>
+      </section>
+      <section class="panel">
+        <div id="cat-list" class="category-list"></div>
+      </section>
+    `;
+    document.getElementById('cat-group').addEventListener('change', () => paint(document.getElementById('cat-group').value, document.getElementById('cat-search').value.toLowerCase()));
+    document.getElementById('cat-search').addEventListener('input', () => paint(document.getElementById('cat-group').value, document.getElementById('cat-search').value.toLowerCase()));
+    paint('all', '');
+  }
+
+  // ---------- VIEW: PHRASES ----------
+  async function renderPhrases() {
+    const [policy, settingsRes] = await Promise.all([api('/api/policy'), api('/api/settings')]);
+    const settings = settingsRes.settings || {};
+    const cats = policy.categories || [];
+    const rows = cats.map(c => `
+      <tr>
+        <td><strong>${esc(c.nl)}</strong><br><span class="hint">${esc(c.en)} · ${esc(c.key)}</span></td>
+        <td>${fmtNum(c.phrase_rules || 0)}</td>
+        <td>${c.phrase_file ? badge('map aanwezig', 'ok') : badge('geen map', 'neutral')}</td>
+        <td><span class="badge ${c.risk === 'critical' || c.risk === 'high' ? 'danger' : (c.risk === 'medium' ? 'warn' : 'neutral')}">${esc(c.risk)}</span></td>
+      </tr>`).join('');
+
+    view.innerHTML = `
+      <section class="panel">
+        <header class="panel-head">
+          <div>
+            <h2>Weighted phrases</h2>
+            <p class="hint">Standaard staan weighted phrases <strong>UIT</strong>. Beheerder zet ze pas aan na het toevoegen van eigen lists.</p>
+          </div>
+          <div>${badge(settings.weighted_phrases_enabled ? 'globaal aan' : 'globaal uit', settings.weighted_phrases_enabled ? 'ok' : 'neutral')}</div>
+        </header>
+        <div class="setting-row">
+          <div>
+            <div class="label">Weighted phrases activeren</div>
+            <div class="sub">Bij UIT worden phrase-blocking volledig overgeslagen, ook als categorieen thresholds hebben.</div>
+          </div>
+          <label class="toggle">
+            <input type="checkbox" id="toggle-phrases" ${settings.weighted_phrases_enabled ? 'checked' : ''}>
+            <span class="slider"></span>
+          </label>
+        </div>
+      </section>
+      <section class="panel">
+        <header class="panel-head"><h2>Phrase mappen</h2><p class="hint">Drop eigen <code>.weightedphraselist</code> bestanden in <code>config/phrases/&lt;categorie&gt;/</code>.</p></header>
+        <div class="table-wrap">
+          <table class="data">
+            <thead><tr><th>Categorie</th><th>Actieve regels</th><th>Map</th><th>Risk</th></tr></thead>
+            <tbody>${rows || `<tr><td colspan="4">${emptyState('Geen phrases', 'Phrase mappen worden bij init aangemaakt.')}</td></tr>`}</tbody>
+          </table>
+        </div>
+      </section>
+    `;
+    document.getElementById('toggle-phrases').addEventListener('change', async (ev) => {
+      try {
+        await post('/api/settings', { weighted_phrases_enabled: ev.target.checked });
+        toast('Weighted phrases ' + (ev.target.checked ? 'aan' : 'uit'), true);
+      } catch (e) { toast(e.message, false); ev.target.checked = !ev.target.checked; }
+    });
+  }
+
+  // ---------- VIEW: DLP ----------
+  async function renderDLP() {
+    const policy = await api('/api/policy');
+    const settings = (await api('/api/settings')).settings || {};
+    const rules = (policy.dlp && policy.dlp.rules) || [];
+    const rows = rules.map((rule, idx) => `
+      <tr>
+        <td><strong>${esc(rule.name)}</strong></td>
+        <td><span class="badge ${rule.enabled ? 'ok' : 'neutral'}">${rule.enabled ? 'actief' : 'uit'}</span></td>
+        <td class="mono">${esc(rule.builtin || rule.pattern || '')}</td>
+        <td>${(rule.groups || []).length ? (rule.groups || []).map(g => `<span class="pill">${esc(g)}</span>`).join(' ') : '<span class="hint">alle groepen</span>'}</td>
+        <td>${esc(rule.action || 'block')}</td>
+        <td class="right">${fmtNum(rule.weight)}</td>
+        <td class="actions"><button class="btn" data-action="dlp-toggle" data-idx="${idx}" data-enabled="${rule.enabled ? 'false' : 'true'}">${rule.enabled ? 'Uitzetten' : 'Aanzetten'}</button></td>
+      </tr>`).join('') || `<tr><td colspan="7">${emptyState('Geen DLP regels', '')}</td></tr>`;
+
+    view.innerHTML = `
+      <section class="panel">
+        <header class="panel-head">
+          <div>
+            <h2>Data Loss Prevention</h2>
+            <p class="hint">DLP scant <strong>uitsluitend</strong> POST/PUT/PATCH request body via REQMOD. Geen URL, geen response body. Voor verdere fine-tuning bewerk <code>dlp_rules.json</code>.</p>
+          </div>
+          <div>${badge(settings.dlp_enabled ? 'globaal aan' : 'globaal uit', settings.dlp_enabled ? 'ok' : 'neutral')}</div>
+        </header>
+        <div class="table-wrap">
+          <table class="data">
+            <thead><tr><th>Naam</th><th>Status</th><th>Patroon / builtin</th><th>Groepen</th><th>Actie</th><th>Gewicht</th><th></th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+        <div class="actions"><a class="btn" href="/edit?path=dlp_rules.json">Geavanceerd bewerken</a></div>
+      </section>
+    `;
+    view.querySelectorAll('[data-action="dlp-toggle"]').forEach(btn => btn.addEventListener('click', async () => {
+      try { await post('/api/dlp/rule', { index: parseInt(btn.dataset.idx, 10), enabled: btn.dataset.enabled === 'true' }); toast('DLP regel aangepast', true); navigate('/dlp', true); }
+      catch (e) { toast(e.message, false); }
+    }));
+  }
+
+  // ---------- VIEW: SERVICES ----------
+  async function renderServices() {
+    const data = await api('/api/services');
+    const rows = (data.services || []).map(s => `
+      <div class="setting-row">
+        <div>
+          <div class="label">${esc(s.label)}</div>
+          <div class="sub">${esc(s.detail || '')}</div>
+        </div>
+        <div>${badge(s.status, s.status === 'running' ? 'ok' : (s.status === 'disabled' ? 'neutral' : 'danger'))}</div>
+      </div>`).join('');
+
+    const errors = [];
+    (data.phrase_load_errors || []).forEach(e => errors.push({ src: 'phrases', msg: e }));
+    (data.dlp_load_errors || []).forEach(e => errors.push({ src: 'dlp', msg: e }));
+    (data.event_load_errors || []).forEach(e => errors.push({ src: 'events', msg: e }));
+
+    view.innerHTML = `
+      <section class="panel">
+        <header class="panel-head">
+          <div><h2>Service status</h2><p class="hint">Realtime check op alle modules.</p></div>
+          <div class="actions">
+            <button class="btn" id="btn-reload-cfg">Config herladen</button>
+            <button class="btn primary" id="btn-netbird-sync">NetBird sync triggeren</button>
+          </div>
+        </header>
+        <div class="grid list">${rows}</div>
+      </section>
+      <section class="panel">
+        <header class="panel-head"><h2>Foutmeldingen</h2></header>
+        ${errors.length ? `<ul class="kvlist">${errors.map(e => `<li><strong>${esc(e.src)}:</strong> ${esc(e.msg)}</li>`).join('')}</ul>` : emptyState('Geen fouten gevonden', 'Alle modules zijn schoon geladen.')}
+      </section>
+    `;
+    document.getElementById('btn-reload-cfg').addEventListener('click', async () => {
+      try { await post('/api/reload', {}); toast('Configuratie herladen', true); navigate('/services', true); }
+      catch (e) { toast(e.message, false); }
+    });
+    document.getElementById('btn-netbird-sync').addEventListener('click', async () => {
+      try {
+        const res = await post('/api/sync/netbird', {});
+        if (res.ok) toast('NetBird sync gestart', true);
+        else toast(res.message || 'Niet uitgevoerd', false);
+      } catch (e) { toast(e.message, false); }
+    });
+  }
+
+  // ---------- VIEW: LOGS ----------
+  async function renderLogs() {
+    const params = new URLSearchParams(location.search);
+    view.innerHTML = `
+      <section class="panel">
+        <header class="panel-head">
+          <div><h2>Logs &amp; events</h2><p class="hint">Persistent opgeslagen in <code>events.jsonl</code>. Filter resultaten hieronder.</p></div>
+        </header>
+        <form id="log-filter" class="row">
+          <label class="field"><span>Zoek</span><input name="q" placeholder="vrij zoeken"></label>
+          <label class="field"><span>Gebruiker</span><input name="user"></label>
+          <label class="field"><span>IP</span><input name="ip"></label>
+          <label class="field"><span>Domein / URL</span><input name="domain"></label>
+          <label class="field"><span>Categorie</span><input name="category"></label>
+          <label class="field"><span>Actie</span><select name="action"><option value="">Alles</option><option value="allow">allow</option><option value="block">block</option></select></label>
+          <label class="field"><span>Reden</span><input name="status" placeholder="malware, dlp, phrase, domain..."></label>
+          <label class="field"><span>Incident</span><input name="incident_id"></label>
+          <label class="field"><span>Van</span><input name="from" type="datetime-local"></label>
+          <label class="field"><span>Tot</span><input name="to" type="datetime-local"></label>
+          <label class="field"><span>Limiet</span><input name="limit" type="number" value="500" min="1" max="5000"></label>
+          <button class="btn primary" type="submit">Filteren</button>
+        </form>
+      </section>
+      <section class="panel">
+        <header class="panel-head"><h2 id="log-count">Resultaten</h2></header>
+        <div id="log-results" class="grid list"><div class="empty">Laden…</div></div>
+      </section>
+    `;
+    const form = document.getElementById('log-filter');
+    ['q','user','ip','domain','category','action','status','incident_id','from','to','limit'].forEach(k => {
+      if (params.get(k)) form.elements[k].value = params.get(k);
+    });
+    async function runFilter(ev) {
+      if (ev) ev.preventDefault();
+      const fd = new FormData(form);
+      const qs = new URLSearchParams();
+      for (const [k, v] of fd.entries()) if (v) qs.set(k, v);
+      const data = await api('/api/logs?' + qs.toString());
+      document.getElementById('log-count').textContent = `${fmtNum(data.filtered_count)} van ${fmtNum(data.total_on_disk)} events`;
+      const rows = (data.events || []).map(e => {
+        const cat = (e.details && e.details.category) || '';
+        return `<details class="event-row" style="display: block;"><summary style="display: grid; grid-template-columns: 140px 1fr auto; gap: 12px; cursor: pointer; align-items: center;">
+          <span class="ts">${esc(fmtTs(e.ts))}</span>
+          <span class="meta">
+            <strong>${esc(e.user || 'anoniem')}</strong> → <strong>${esc(e.domain || '')}</strong>
+            <br><span class="hint">${esc(e.url || '')}</span>
+          </span>
+          <span>${badge(e.action, e.action === 'block' ? 'danger' : 'ok')} ${cat ? badge(cat, 'warn') : ''}</span>
+        </summary>
+        <div style="padding: 10px 14px; background: var(--surface); border-top: 1px solid var(--border); border-radius: 0 0 6px 6px;">
+          <dl class="kvlist">
+            <dt>Incident ID</dt><dd class="mono">${esc(e.incident_id || '')}</dd>
+            <dt>Reden</dt><dd>${esc(e.reason || '')}</dd>
+            <dt>Public reason</dt><dd>${esc(e.public_reason || '')}</dd>
+            <dt>Policy</dt><dd>${esc(e.policy || '')}</dd>
+            <dt>Methode</dt><dd>${esc(e.method || '')}</dd>
+            <dt>Source IP</dt><dd class="mono">${esc(e.source_ip || '')}</dd>
+            <dt>Groepen</dt><dd>${(e.groups || []).join(', ')}</dd>
+            <dt>Content-Type</dt><dd>${esc(e.content_type || '')}</dd>
+            <dt>Body bytes</dt><dd>${fmtNum(e.body_bytes)}</dd>
+            <dt>ClamAV</dt><dd>${esc((e.clam && e.clam.status) || '')} ${e.clam && e.clam.signature ? '— ' + esc(e.clam.signature) : ''}</dd>
+            <dt>Phrase hits</dt><dd>${(e.phrase_hits || []).map(h => `<span class="pill">${esc(h.category)}: ${esc(h.phrase)} ×${esc(h.count)}</span>`).join(' ') || '<span class="hint">geen</span>'}</dd>
+            <dt>DLP hits</dt><dd>${(e.dlp_hits || []).map(h => `<span class="pill">${esc(h.name)} ×${esc(h.count)}</span>`).join(' ') || '<span class="hint">geen</span>'}</dd>
+            <dt>Details</dt><dd class="mono">${esc(JSON.stringify(e.details || {}))}</dd>
+          </dl>
+        </div></details>`;
+      }).join('') || emptyState('Geen logs gevonden', 'Pas filters aan of voer eerst verkeer door de ICAP service.');
+      document.getElementById('log-results').innerHTML = rows;
+    }
+    form.addEventListener('submit', runFilter);
+    runFilter();
+  }
+
+  // ---------- VIEW: SETTINGS ----------
+  async function renderSettings() {
+    const data = await api('/api/settings');
+    const settings = data.settings || {};
+    const toggles = [
+      ['webfilter_enabled', 'Webfilter', 'Master toggle voor content filtering en domeinblokkering.'],
+      ['domain_blocking_enabled', 'Domeinblokkering', 'Schakel blocklist/UT1 in of uit. Allowlist blijft altijd doorlopen.'],
+      ['weighted_phrases_enabled', 'Weighted phrases', 'Standaard UIT. Zet pas aan na het toevoegen van eigen phrase lists.'],
+      ['dlp_enabled', 'Data Loss Prevention', 'DLP scant enkel POST/PUT/PATCH body via REQMOD.'],
+      ['antivirus_enabled', 'Antivirus (ClamAV)', 'ClamAV scanning voor request en response body.'],
+      ['logging_enabled', 'Logging', 'Persistente event logs naar events.jsonl.'],
+      ['netbird_sync_enabled', 'NetBird sync', 'Backend timer-service sync_netbird_users.py.'],
+    ];
+    const rows = toggles.map(([key, label, sub]) => `
+      <div class="setting-row">
+        <div>
+          <div class="label">${esc(label)}</div>
+          <div class="sub">${esc(sub)}</div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" data-key="${esc(key)}" ${settings[key] ? 'checked' : ''}>
+          <span class="slider"></span>
+        </label>
+      </div>`).join('');
+
+    view.innerHTML = `
+      <section class="panel">
+        <header class="panel-head">
+          <div><h2>Master-toggles</h2><p class="hint">Wijzigingen worden direct opgeslagen in <code>config.json</code>.</p></div>
+        </header>
+        <div class="grid list">${rows}</div>
+      </section>
+      <section class="panel">
+        <header class="panel-head"><h2>Extra opties</h2></header>
+        <div class="setting-row">
+          <div><div class="label">Allow domains bypass content</div><div class="sub">Allowlist mag verdere content-scans overslaan. Verzekert dat allowlist boven blocklist staat.</div></div>
+          <label class="toggle"><input type="checkbox" id="opt-bypass" ${data.allow_domains_bypass_content ? 'checked' : ''}><span class="slider"></span></label>
+        </div>
+        <div class="setting-row">
+          <div><div class="label">ClamAV fail open</div><div class="sub">Bij scanner fout verkeer toelaten in plaats van blokkeren.</div></div>
+          <label class="toggle"><input type="checkbox" id="opt-clam-failopen" ${data.clamav_fail_open ? 'checked' : ''}><span class="slider"></span></label>
+        </div>
+      </section>
+      <section class="panel">
+        <header class="panel-head"><h2>Geavanceerd</h2></header>
+        <div class="actions">
+          <a class="btn" href="/edit?path=config.json">Bewerk config.json</a>
+          <a class="btn" href="/edit?path=users.json">Bewerk users.json</a>
+          <a class="btn" href="/edit?path=dlp_rules.json">Bewerk dlp_rules.json</a>
+        </div>
+      </section>
+    `;
+    view.querySelectorAll('input[type="checkbox"][data-key]').forEach(inp => {
+      inp.addEventListener('change', async () => {
+        try { await post('/api/settings', { [inp.dataset.key]: inp.checked }); toast(inp.dataset.key + ': ' + (inp.checked ? 'aan' : 'uit'), true); }
+        catch (e) { toast(e.message, false); inp.checked = !inp.checked; }
+      });
+    });
+    document.getElementById('opt-bypass').addEventListener('change', async (ev) => {
+      try { await post('/api/settings', { allow_domains_bypass_content: ev.target.checked }); toast('Allowlist bypass: ' + (ev.target.checked ? 'aan' : 'uit'), true); }
+      catch (e) { toast(e.message, false); ev.target.checked = !ev.target.checked; }
+    });
+    document.getElementById('opt-clam-failopen').addEventListener('change', async (ev) => {
+      try { await post('/api/settings', { clamav_fail_open: ev.target.checked }); toast('ClamAV fail open: ' + (ev.target.checked ? 'aan' : 'uit'), true); }
+      catch (e) { toast(e.message, false); ev.target.checked = !ev.target.checked; }
+    });
+  }
+
+  // ---------- VIEW: TEST ----------
+  async function renderTest() {
+    view.innerHTML = `
+      <section class="panel">
+        <header class="panel-head"><h2>Policy test</h2><p class="hint">Simuleer een ICAP-aanvraag zonder live verkeer.</p></header>
+        <form id="test-form" class="row">
+          <label class="field"><span>URL</span><input name="url" value="https://example.org/"></label>
+          <label class="field"><span>Gebruiker</span><input name="user" value=""></label>
+          <label class="field"><span>Groepen</span><input name="groups" value=""></label>
+          <label class="field"><span>Methode/direction</span>
+            <select name="direction"><option value="reqmod">REQMOD</option><option value="respmod">RESPMOD</option></select>
+          </label>
+          <label class="field"><span>Content-Type</span><input name="content_type" value="text/plain"></label>
+          <label class="check"><input name="skip_clamav" type="checkbox" checked> ClamAV overslaan</label>
+          <label class="field" style="grid-column: 1 / -1"><span>Body</span><textarea name="body">casino test</textarea></label>
+          <button class="btn primary" type="submit">Run test</button>
+        </form>
+      </section>
+      <section class="panel">
+        <header class="panel-head"><h2>Resultaat</h2></header>
+        <pre id="test-result" style="background: var(--surface-2); padding: 14px; border-radius: 8px; border: 1px solid var(--border); max-height: 60vh; overflow: auto; font-family: ui-monospace, Consolas, monospace; font-size: 12px;"></pre>
+      </section>
+    `;
+    document.getElementById('test-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const fd = new FormData(ev.target);
+      const data = Object.fromEntries(fd.entries());
+      if (!fd.has('skip_clamav')) data.skip_clamav = 'off';
+      try {
+        const res = await fetch('/api/test', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data) });
+        const json = await res.json();
+        document.getElementById('test-result').textContent = JSON.stringify(json, null, 2);
+      } catch (e) { document.getElementById('test-result').textContent = e.message; }
+    });
+  }
+
+  // ---------- VIEW: FILES ----------
+  async function renderFiles() {
+    const data = await api('/api/files');
+    const rows = (data.files || []).map(f => `
+      <tr>
+        <td><a href="/edit?path=${encodeURIComponent(f.path)}"><strong>${esc(f.path)}</strong></a></td>
+        <td>${fmtNum(f.size)} bytes</td>
+        <td class="mono">${esc(f.mtime)}</td>
+        <td class="actions"><a class="btn" href="/edit?path=${encodeURIComponent(f.path)}">Bewerk</a></td>
+      </tr>`).join('') || `<tr><td colspan="4">${emptyState('Geen bewerkbare bestanden', '')}</td></tr>`;
+    view.innerHTML = `
+      <section class="panel">
+        <header class="panel-head">
+          <div><h2>Bestanden</h2><p class="hint">Configbestanden in <code>config/</code>. Automatische backup bij elke save.</p></div>
+        </header>
+        <div class="table-wrap">
+          <table class="data"><thead><tr><th>Pad</th><th>Grootte</th><th>Gewijzigd</th><th></th></tr></thead><tbody>${rows}</tbody></table>
+        </div>
+      </section>
+    `;
+  }
+
+  // Link interception: any <a data-route> inside the view navigates without reload
+  function bindRouteLinks() {
+    view.querySelectorAll('a[data-route]').forEach(a => a.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      navigate(a.dataset.route);
+    }));
+  }
+  document.body.addEventListener('click', (ev) => {
+    const a = ev.target.closest('a[data-route]');
+    if (a && view.contains(a)) {
+      ev.preventDefault();
+      navigate(a.dataset.route);
+    }
+  });
+
+  // initial render
+  navigate(location.pathname, true);
+})();
+"""
 
 
 # Uitgebreide ingebouwde phrase seeds voor alle E2Guardian-categorieën.
 # Deze seeds zijn bedoeld als veilige, onderhoudbare basis voor labo/PoC-gebruik.
 # Zet officiële of school-specifieke e2guardian/DansGuardian lijsten gewoon in
 # config/phrases/<categorie>/ als extra .weightedphraselist-bestanden.
-MODERN_DASHBOARD_CSS = """
-:root { --bg:#f4f7fb; --surface:#fff; --surface-2:#eef4f8; --text:#17202a; --muted:#64748b; --line:#d9e2ec; --brand:#0f6f95; --danger:#b42318; --shadow:0 16px 34px rgba(15,23,42,.08); }
-body.app-shell { min-height:100vh; overflow-x:hidden; background:var(--bg); color:var(--text); }
-.sidebar { position:fixed; inset:0 auto 0 0; width:260px; background:#101820; color:#f4f7fb; border-right:1px solid rgba(255,255,255,.08); z-index:20; transition:width .2s ease, transform .2s ease; }
-.brand { display:flex; align-items:center; gap:12px; padding:18px; min-height:74px; }
-.brand-mark { display:grid; place-items:center; width:40px; height:40px; border-radius:8px; background:var(--brand); color:white; font-weight:900; }
-.brand-copy { display:grid; gap:2px; min-width:0; } .brand-copy span { color:#9fb1c2; font-size:12px; }
-.side-nav { display:grid; gap:4px; padding:8px; } .side-nav a { display:block; color:#dce8f2; background:transparent; border:0; padding:10px 12px; border-radius:6px; }
-.side-nav a.active, .side-nav a:hover { background:rgba(15,111,149,.24); color:#fff; }
-.app-main { margin-left:260px; min-width:0; transition:margin-left .2s ease; }
-.topbar { position:sticky; top:0; z-index:12; min-height:74px; display:flex; align-items:center; justify-content:space-between; gap:16px; padding:14px 22px; background:rgba(255,255,255,.92); backdrop-filter:blur(14px); border-bottom:1px solid var(--line); }
-.topbar-left,.topbar-actions { display:flex; align-items:center; gap:12px; min-width:0; } .topbar h1 { margin:0; font-size:21px; } .topbar p { margin:2px 0 0; color:var(--muted); }
-.icon-btn,.ghost-btn,.primary-btn { min-height:38px; border-radius:6px; border:1px solid var(--line); } .icon-btn { width:40px; padding:0; background:var(--surface); } .ghost-btn { background:var(--surface); color:var(--text); } .primary-btn { background:var(--brand); color:white; border-color:var(--brand); }
-.content { width:min(1500px, calc(100vw - 300px)); margin:18px auto; } .page { display:none; } .page.active { display:block; }
-.metric-grid { display:grid; grid-template-columns:repeat(6,minmax(130px,1fr)); gap:12px; margin-bottom:14px; }
-.metric,.card,.service-card,.policy-card { background:var(--surface); border:1px solid var(--line); border-radius:8px; box-shadow:var(--shadow); }
-.metric { min-height:96px; display:grid; align-content:center; gap:3px; padding:15px; } .metric span,.metric small,.card-head span,.service-card p,.policy-card p { color:var(--muted); } .metric strong { font-size:28px; line-height:1; }
-.status-strip { display:grid; grid-template-columns:repeat(6,minmax(150px,1fr)); gap:10px; margin-bottom:16px; }
-.status-pill { display:flex; align-items:center; gap:9px; padding:10px; background:var(--surface); border:1px solid var(--line); border-radius:8px; min-width:0; } .status-pill span:last-child { display:block; color:var(--muted); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.dashboard-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:16px; } .card { padding:16px; min-width:0; } .span-2 { grid-column:span 2; }
-.card-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px; } .card-head h2 { margin:0; font-size:16px; } canvas { width:100%; max-width:100%; display:block; }
-.empty { color:var(--muted); margin:10px 0; } .rank-list,.event-list,.service-grid,.policy-grid,.file-grid,.toggle-grid { display:grid; gap:9px; }
-.rank-row,.mini-event,.policy-card,.service-card,.file-tile { padding:11px; border:1px solid var(--line); border-radius:7px; background:var(--surface-2); } .rank-row { display:flex; justify-content:space-between; gap:10px; } .mini-event span,.file-tile span { display:block; color:var(--muted); margin-top:4px; word-break:break-word; }
-.badge { display:inline-flex; align-items:center; min-height:24px; border-radius:999px; padding:3px 8px; font-size:12px; font-weight:800; color:#334155; background:#e5edf4; } .badge.ok { color:#0f5132; background:#d9f3e6; } .badge.bad { color:#842029; background:#ffe0dc; } .badge.muted { color:#475569; background:#e5e7eb; }
-.filter-grid { display:grid; grid-template-columns:repeat(4,minmax(160px,1fr)); gap:10px; margin-bottom:12px; } .table-wrap { width:100%; overflow-x:auto; border:1px solid var(--line); border-radius:8px; }
-table { width:100%; border-collapse:collapse; min-width:900px; background:var(--surface); } th,td { padding:10px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; } th { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:0; background:var(--surface-2); } tr:hover td { background:rgba(15,111,149,.06); cursor:pointer; }
-.detail-card pre { max-height:320px; } .detail-list { display:grid; grid-template-columns:150px minmax(0,1fr); gap:8px 12px; } .detail-list dt { color:var(--muted); font-weight:800; } .detail-list dd { margin:0; min-width:0; word-break:break-word; }
-.split-grid { display:grid; grid-template-columns:minmax(300px,420px) minmax(0,1fr); gap:16px; } .user-row { display:grid; width:100%; text-align:left; gap:3px; background:var(--surface-2); color:var(--text); border-color:var(--line); } .user-row.active { outline:2px solid var(--brand); } .user-row span { color:var(--muted); }
-.modern-form { margin:10px 0 14px; } .modern-toolbar { margin:0 0 14px; } .policy-grid { grid-template-columns:repeat(2,minmax(260px,1fr)); } .policy-card { display:grid; grid-template-columns:minmax(0,1fr) auto auto; align-items:center; gap:12px; box-shadow:none; }
-.service-grid { grid-template-columns:repeat(4,minmax(180px,1fr)); margin-bottom:12px; } .service-card { box-shadow:none; padding:14px; } .toggle-grid { grid-template-columns:repeat(3,minmax(220px,1fr)); }
-.switch-row { display:flex; justify-content:space-between; align-items:center; gap:10px; min-height:42px; padding:10px; border:1px solid var(--line); border-radius:7px; background:var(--surface-2); } .switch-row input { width:auto; transform:scale(1.1); }
-.notice { padding:12px; border:1px solid #b9d1df; background:#eaf5fb; color:#16445e; border-radius:8px; margin-bottom:14px; } .file-grid { grid-template-columns:repeat(3,minmax(220px,1fr)); } .file-tile { color:var(--text); text-decoration:none; }
-footer { padding:18px 22px; color:var(--muted); text-align:center; }
-body.sidebar-collapsed .sidebar { width:72px; } body.sidebar-collapsed .brand-copy, body.sidebar-collapsed .side-nav a { font-size:0; } body.sidebar-collapsed .app-main { margin-left:72px; } body.sidebar-collapsed .content { width:min(1500px, calc(100vw - 112px)); }
-body[data-theme="dark"], body[data-theme="dark"].app-shell { --bg:#10141b; --surface:#19212b; --surface-2:#202b36; --text:#e9eef5; --muted:#aab7c6; --line:#344052; --shadow:0 16px 34px rgba(0,0,0,.22); } body[data-theme="dark"] .topbar { background:rgba(25,33,43,.92); } body[data-theme="dark"] .notice { background:#142938; color:#bde7ff; border-color:#31566a; } body[data-theme="dark"] input, body[data-theme="dark"] select, body[data-theme="dark"] textarea { background:#101820; color:#f4f7fb; border-color:#465568; }
-@media (prefers-color-scheme: dark) { body.app-shell:not([data-theme="light"]) { --bg:#10141b; --surface:#19212b; --surface-2:#202b36; --text:#e9eef5; --muted:#aab7c6; --line:#344052; --shadow:0 16px 34px rgba(0,0,0,.22); } body.app-shell:not([data-theme="light"]) .topbar { background:rgba(25,33,43,.92); } }
-@media (max-width:1100px) { .metric-grid,.status-strip { grid-template-columns:repeat(3,minmax(0,1fr)); } .dashboard-grid,.service-grid,.file-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } .filter-grid,.toggle-grid,.policy-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } .span-2 { grid-column:span 2; } }
-@media (max-width:820px) { .sidebar { transform:translateX(-100%); width:260px; } body:not(.sidebar-collapsed) .sidebar { transform:translateX(0); } .app-main,body.sidebar-collapsed .app-main { margin-left:0; } .content,body.sidebar-collapsed .content { width:min(100%, calc(100vw - 22px)); } .topbar { align-items:flex-start; flex-direction:column; } .metric-grid,.status-strip,.dashboard-grid,.service-grid,.file-grid,.filter-grid,.toggle-grid,.policy-grid,.split-grid { grid-template-columns:1fr; } .span-2 { grid-column:auto; } .policy-card { grid-template-columns:1fr; } }
-"""
-
-
 DEFAULT_ENGLISH_PHRASE_SEEDS: dict[str, list[str]] = {
     "adult": ["explicit adult", "adult content", "adult website", "mature content", "sexually explicit", "nsfw content", "adult chat", "adult webcam", "adult dating", "erotic story"],
     "pornography": ["porn", "pornography", "xxx", "sex video", "adult video", "explicit sex", "porn site", "hardcore adult", "adult movie", "cam site"],
@@ -3784,34 +4706,27 @@ def default_phrase_thresholds(multiplier: float = 1.0) -> dict[str, int]:
 
 
 def build_default_phrase_file(category: str, language: str) -> str:
+    """
+    Bouw een LEGE weighted phrase placeholder voor de gegeven categorie.
+
+    Belangrijk: standaard worden er GEEN phrases geactiveerd. De beheerder
+    voegt later zelf eigen phrase lists toe. Dit bestand bevat enkel een
+    listcategory header en commentaar zodat de structuur duidelijk blijft.
+    """
     entry = catalog_entry(category)
     key = entry["key"]
-    seeds = DEFAULT_DUTCH_PHRASE_SEEDS.get(key) if language == "dutch" else DEFAULT_ENGLISH_PHRASE_SEEDS.get(key)
-    if not seeds:
-        label = entry.get("nl" if language == "dutch" else "en", key)
-        seeds = [key.replace("_", " "), str(label).lower()]
-    base_weight = 12
-    risk = entry.get("risk", "medium")
-    if risk in {"critical", "high"}:
-        base_weight = 35
-    elif risk == "medium":
-        base_weight = 20
-    elif risk == "allow":
-        base_weight = -35
+    label_en = entry.get("en", key)
+    label_nl = entry.get("nl", key)
     lines = [
         f'#listcategory: "{key}"',
-        f"# Auto-generated default {language} weighted phrase list for {entry.get('en', key)} / {entry.get('nl', key)}.",
-        "# Format: {weight}<phrase>. Higher positive weight blocks faster; negative weight lowers score.",
-        "# Replace/extend these seeds with your official e2guardian lists if available.",
-        "",
+        f"# Weighted phrase placeholder voor categorie: {label_en} / {label_nl}.",
+        f"# Standaard zijn er GEEN actieve phrases voor deze categorie.",
+        "# Voeg eigen regels toe in de vorm: {weight}<zin of woord>.",
+        "# Positief gewicht verhoogt de score (blokkeren), negatief verlaagt.",
+        "# Voorbeelden:",
+        f"# {{30}}<voorbeeld zin voor {key}>",
+        "# {-30}<veilige educatieve context>",
     ]
-    for phrase in seeds:
-        phrase = phrase.strip()
-        if not phrase:
-            continue
-        lines.append(f"{{{base_weight}}}<{phrase}>")
-    if key != "goodphrases":
-        lines.extend(["", "# Safe educational context exceptions", "{-30}<school project>", "{-30}<security training>", "{-25}<medical awareness>"])
     return "\n".join(lines).rstrip() + "\n"
 
 def default_config() -> dict[str, Any]:
@@ -3825,11 +4740,20 @@ def default_config() -> dict[str, Any]:
             "preview_bytes": 4096,
             "max_body_bytes": DEFAULT_BODY_LIMIT,
         },
+        # Globale master-toggles. Bewust geplaatst zodat het dashboard ze
+        # eenvoudig kan tonen/aanpassen. Weighted phrases staat standaard
+        # UIT en moet expliciet aangezet worden door de beheerder.
+        "settings": {
+            "webfilter_enabled": True,
+            "domain_blocking_enabled": True,
+            "weighted_phrases_enabled": False,
+            "dlp_enabled": True,
+            "antivirus_enabled": True,
+            "logging_enabled": True,
+            "netbird_sync_enabled": True,
+        },
         "scan": {
             "text_scan_bytes": DEFAULT_TEXT_SCAN_BYTES,
-        },
-        "logging": {
-            "enabled": True,
         },
         "clamav": {
             "enabled": True,
@@ -3841,14 +4765,15 @@ def default_config() -> dict[str, Any]:
             "fail_open": False,
         },
         "phrase_lists": {
-            "enabled": False,
             "default_weight": 10,
             "extensions": [".weightedphraselist", ".phraselist", ".txt"],
             "match_individual_tags": False,
         },
         "identity": {
+            # Default group wordt enkel gebruikt als er geen NetBird-/Entra
+            # info beschikbaar is. Het maakt geen policy aan; gebruikers
+            # zonder bekende groep vallen terug op common_policy.
             "default_group": "default",
-            "netbird_sync_enabled": False,
             "client_ip_headers": ["X-Client-IP", "X-Forwarded-For", "X-Real-IP"],
             "username_headers": ["X-Client-Username", "X-Authenticated-User", "X-Squid-Username"],
             "http_username_headers": ["X-NetBird-User", "X-Authenticated-User"],
@@ -3857,26 +4782,30 @@ def default_config() -> dict[str, Any]:
             "entra_group_map": {},
         },
         "common_policy": {
-            "webfiltering_enabled": True,
-            "domain_blocking_enabled": True,
             "malware": True,
             "dlp_enabled": True,
             "dlp_score_threshold": 60,
-            "dlp_fail_open": False,
-            "webfilter_fail_open": False,
             "max_body_bytes": DEFAULT_BODY_LIMIT,
             "oversize_action": "allow",
-            "hard_blocked_domains": ["malware.test.invalid"],
+            # Geen voorbeelddomeinen in default - beheerder vult zelf in.
+            "hard_blocked_domains": [],
             "blocked_domains": [],
-            "allowed_domains": ["*.school.example"],
-            "allow_domains_bypass_content": False,
+            "allowed_domains": [],
+            # Allowlist moet ALTIJD prioriteit hebben en mag content-scans
+            # overslaan. Daarom standaard True.
+            "allow_domains_bypass_content": True,
             "blocked_mime_types": [
                 "application/x-msdownload",
                 "application/x-dosexec",
                 "application/vnd.microsoft.portable-executable",
             ],
+            # Phrase thresholds zijn standaard leeg. Beheerder activeert
+            # ze pas wanneer weighted phrases bewust aanstaat.
             "phrase_thresholds": {},
         },
+        # GEEN default student/teacher policies. NetBird-groepen worden via
+        # sync_netbird_users.py aangemaakt, en de beheerder maakt zelf
+        # eigen groepen aan via het dashboard.
         "policies": {},
     }
 
