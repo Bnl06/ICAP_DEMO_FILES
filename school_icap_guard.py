@@ -62,7 +62,8 @@ MAX_HEADER_LINE = 65536
 MAX_HEADERS_BYTES = 1024 * 1024
 DEFAULT_TEXT_SCAN_BYTES = 2 * 1024 * 1024
 DEFAULT_BODY_LIMIT = 25 * 1024 * 1024
-DEFAULT_UT1_BLACKLIST_URL = "ftp://ftp.ut-capitole.fr/pub/reseau/cache/squidguard_contrib/blacklists.tar.gz"
+DEFAULT_UT1_BLACKLIST_URL = "http://dsi.ut-capitole.fr/blacklists/download/all.tar.gz"
+LEGACY_UT1_BLACKLIST_URL = "ftp://ftp.ut-capitole.fr/pub/reseau/cache/squidguard_contrib/blacklists.tar.gz"
 
 
 E2G_CATEGORY_CATALOG: list[dict[str, Any]] = [
@@ -2227,14 +2228,18 @@ class DashboardServer(ThreadingHTTPServer):
 
 
 def policy_target(config: dict[str, Any], target: str) -> tuple[str, dict[str, Any]]:
-    target = slugify_key(target or "all")
-    if target in {"all", "common", "alle"}:
+    raw_target = str(target or "all").strip()
+    target_key = slugify_key(raw_target)
+    if target_key in {"all", "common", "alle"}:
         config.setdefault("common_policy", {})
         return "all", config["common_policy"]
     policies = config.setdefault("policies", {})
-    if target not in policies:
-        raise ValueError(f"onbekende groep: {target}")
-    return target, policies[target]
+    # Eerst exact matchen: NetBird-groepen kunnen hoofdletters/spaties bevatten.
+    if raw_target in policies:
+        return raw_target, policies[raw_target]
+    if target_key in policies:
+        return target_key, policies[target_key]
+    raise ValueError(f"onbekende groep: {raw_target}")
 
 
 def split_groups(value: Any) -> list[str]:
@@ -2429,6 +2434,10 @@ def import_ut1_blacklist_archive(store: ConfigStore, archive_path: pathlib.Path,
 
 
 def dashboard_import_blacklist_url(store: ConfigStore, data: dict[str, Any]) -> dict[str, Any]:
+    # Categories/policy ophalen mag nooit automatisch een externe blacklist downloaden.
+    # Alleen de expliciete dashboardknop stuurt manual=true mee.
+    if not parse_bool(str(data.get("manual", "false")), False):
+        return {"ok": False, "skipped": True, "message": "URL-import overgeslagen: geen expliciete importactie"}
     url = str(data.get("url") or DEFAULT_UT1_BLACKLIST_URL).strip()
     if not url:
         raise ValueError("blacklist URL is leeg")
@@ -2437,9 +2446,13 @@ def dashboard_import_blacklist_url(store: ConfigStore, data: dict[str, Any]) -> 
     tmp_dir = pathlib.Path(tempfile.mkdtemp(prefix="ut1-download-", dir=str(store.config_dir)))
     archive_path = tmp_dir / "blacklists.tar.gz"
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
-        with urllib.request.urlopen(req, timeout=120) as response, archive_path.open("wb") as out:
-            shutil.copyfileobj(response, out, length=1024 * 1024)
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
+            with urllib.request.urlopen(req, timeout=180) as response, archive_path.open("wb") as out:
+                shutil.copyfileobj(response, out, length=1024 * 1024)
+        except Exception as exc:
+            hint = "Gebruik bij voorkeur http://dsi.ut-capitole.fr/blacklists/download/all.tar.gz of upload het .tar.gz bestand lokaal."
+            raise RuntimeError(f"download van blacklist mislukt: {exc}. {hint}") from exc
         result = import_ut1_blacklist_archive(store, archive_path, source=url)
         # Belangrijk: herlaad de blacklist-engine meteen na import.
         # Anders is het archief wel opgeslagen, maar toont /api/policy nog
@@ -4396,7 +4409,8 @@ DASHBOARD_JS = r"""
     let data = await api('/api/policy');
     const groups = ['all', ...(data.groups || [])];
     const blacklist = data.blacklist || {};
-    const sourceUrl = blacklist.source_url || 'ftp://ftp.ut-capitole.fr/pub/reseau/cache/squidguard_contrib/blacklists.tar.gz';
+    let sourceUrl = blacklist.source_url || 'http://dsi.ut-capitole.fr/blacklists/download/all.tar.gz';
+    if (sourceUrl === 'ftp://ftp.ut-capitole.fr/pub/reseau/cache/squidguard_contrib/blacklists.tar.gz') sourceUrl = 'http://dsi.ut-capitole.fr/blacklists/download/all.tar.gz';
 
     function enabledFor(c, group) {
       return !!(c.enabled && c.enabled[group]);
@@ -4430,12 +4444,41 @@ DASHBOARD_JS = r"""
 
     function bindToggles() {
       view.querySelectorAll('[data-action="ut1-toggle"]').forEach(btn => btn.addEventListener('click', async () => {
+        const wanted = btn.dataset.enabled === 'true';
+        const oldText = btn.textContent;
+        const oldEnabled = btn.dataset.enabled;
+        const oldPrimary = btn.classList.contains('primary');
         try {
-          await post('/api/policy/category', { target: btn.dataset.group, category: btn.dataset.key, enabled: btn.dataset.enabled === 'true' });
-          toast('UT1 categorie aangepast', true);
-          data = await api('/api/policy');
-          paint(document.getElementById('cat-search').value.toLowerCase());
-        } catch (e) { toast(e.message, false); }
+          btn.disabled = true;
+          // Meteen visueel aanpassen: Uit -> Aan of Aan -> Uit.
+          btn.classList.toggle('primary', wanted);
+          btn.textContent = wanted ? 'Aan' : 'Uit';
+          btn.dataset.enabled = wanted ? 'false' : 'true';
+
+          const result = await post('/api/policy/category', {
+            target: btn.dataset.group,
+            category: btn.dataset.key,
+            enabled: wanted
+          });
+          const finalState = result && typeof result.enabled === 'boolean' ? result.enabled : wanted;
+          btn.classList.toggle('primary', finalState);
+          btn.textContent = finalState ? 'Aan' : 'Uit';
+          btn.dataset.enabled = finalState ? 'false' : 'true';
+
+          const row = (data.categories || []).find(c => c.key === btn.dataset.key);
+          if (row) {
+            row.enabled = row.enabled || {};
+            row.enabled[btn.dataset.group] = finalState;
+          }
+          toast('UT1 categorie aangepast: ' + (finalState ? 'Aan' : 'Uit'), true);
+        } catch (e) {
+          btn.textContent = oldText;
+          btn.dataset.enabled = oldEnabled;
+          btn.classList.toggle('primary', oldPrimary);
+          toast(e.message || 'Categorie aanpassen mislukt', false);
+        } finally {
+          btn.disabled = false;
+        }
       }));
     }
 
@@ -4462,7 +4505,7 @@ DASHBOARD_JS = r"""
           <div><h2>Blacklist toevoegen / updaten</h2><p class="hint">Default staat op de officiele UT1 blacklist URL. Na import wordt de engine automatisch herladen.</p></div>
         </header>
         <form id="ut1-url-form" class="row" onsubmit="return false;">
-          <label class="field" style="flex:1 1 520px"><span>Blacklist URL</span><input id="ut1-url" value="${esc(sourceUrl)}" placeholder="ftp://ftp.ut-capitole.fr/pub/reseau/cache/squidguard_contrib/blacklists.tar.gz"></label>
+          <label class="field" style="flex:1 1 520px"><span>Blacklist URL</span><input id="ut1-url" value="${esc(sourceUrl)}" placeholder="http://dsi.ut-capitole.fr/blacklists/download/all.tar.gz"></label>
           <button type="button" class="btn primary" id="ut1-import-url">Importeer URL</button>
         </form>
         <form id="ut1-upload-form" class="row" onsubmit="return false;" enctype="multipart/form-data">
@@ -4493,12 +4536,16 @@ DASHBOARD_JS = r"""
         btn.disabled = true;
         btn.textContent = 'Import bezig...';
         toast('UT1 import gestart. Dit kan even duren...', true);
-        const result = await post('/api/blacklist/import', { url });
+        // Alleen downloaden wanneer je expliciet op deze importknop drukt.
+        const result = await post('/api/blacklist/import', { url, manual: true });
         toast(`UT1 blacklist geimporteerd: ${fmtNum(result.loaded_categories || result.categories || 0)} categorieen, ${fmtNum(result.loaded_domains || 0)} domeinen`, true);
         data = await api('/api/policy');
         navigate('/categories', true);
       } catch (e) {
-        toast(e.message || 'Import mislukt', false);
+        const msg = (e && e.message && e.message.includes('NetworkError'))
+          ? 'URL-import kon geen antwoord krijgen van de server. Gebruik de HTTP-URL of upload het .tar.gz bestand lokaal.'
+          : (e.message || 'Import mislukt');
+        toast(msg, false);
       } finally {
         btn.disabled = false;
         btn.textContent = 'Importeer URL';
