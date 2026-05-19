@@ -2441,7 +2441,14 @@ def dashboard_import_blacklist_url(store: ConfigStore, data: dict[str, Any]) -> 
         with urllib.request.urlopen(req, timeout=120) as response, archive_path.open("wb") as out:
             shutil.copyfileobj(response, out, length=1024 * 1024)
         result = import_ut1_blacklist_archive(store, archive_path, source=url)
+        # Belangrijk: herlaad de blacklist-engine meteen na import.
+        # Anders is het archief wel opgeslagen, maar toont /api/policy nog
+        # oude stats tot de service/reload opnieuw gebeurt.
+        store.reload()
         result["url"] = url
+        result["loaded_categories"] = len(store.domain_blacklist.category_stats) if store.domain_blacklist else 0
+        result["loaded_domains"] = store.domain_blacklist.total_domains() if store.domain_blacklist else 0
+        result["loaded_urls"] = store.domain_blacklist.total_urls() if store.domain_blacklist else 0
         return result
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -2488,7 +2495,13 @@ def dashboard_import_blacklist_upload(handler: BaseHTTPRequestHandler, store: Co
     archive_path = tmp_dir / filename
     try:
         archive_path.write_bytes(file_bytes)
-        return import_ut1_blacklist_archive(store, archive_path, source=f"upload:{filename}")
+        result = import_ut1_blacklist_archive(store, archive_path, source=f"upload:{filename}")
+        # Zelfde reden als bij URL-import: dashboard meteen actuele UT1-data geven.
+        store.reload()
+        result["loaded_categories"] = len(store.domain_blacklist.category_stats) if store.domain_blacklist else 0
+        result["loaded_domains"] = store.domain_blacklist.total_domains() if store.domain_blacklist else 0
+        result["loaded_urls"] = store.domain_blacklist.total_urls() if store.domain_blacklist else 0
+        return result
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -4450,11 +4463,11 @@ DASHBOARD_JS = r"""
         </header>
         <form id="ut1-url-form" class="row" onsubmit="return false;">
           <label class="field" style="flex:1 1 520px"><span>Blacklist URL</span><input id="ut1-url" value="${esc(sourceUrl)}" placeholder="ftp://ftp.ut-capitole.fr/pub/reseau/cache/squidguard_contrib/blacklists.tar.gz"></label>
-          <button class="btn primary" id="ut1-import-url">Importeer URL</button>
+          <button type="button" class="btn primary" id="ut1-import-url">Importeer URL</button>
         </form>
         <form id="ut1-upload-form" class="row" onsubmit="return false;" enctype="multipart/form-data">
           <label class="field" style="flex:1 1 360px"><span>Of upload lokaal .tar.gz bestand</span><input id="ut1-file" type="file" accept=".gz,.tgz,.tar"></label>
-          <button class="btn" id="ut1-import-file">Upload/importeer</button>
+          <button type="button" class="btn" id="ut1-import-file">Upload/importeer</button>
         </form>
       </section>
 
@@ -4474,29 +4487,45 @@ DASHBOARD_JS = r"""
 
     document.getElementById('cat-search').addEventListener('input', (ev) => paint(ev.target.value.toLowerCase()));
     document.getElementById('ut1-import-url').addEventListener('click', async () => {
+      const btn = document.getElementById('ut1-import-url');
       const url = document.getElementById('ut1-url').value.trim();
       try {
-        toast('UT1 import gestart...', true);
-        await post('/api/blacklist/import', { url });
-        toast('UT1 blacklist geimporteerd', true);
+        btn.disabled = true;
+        btn.textContent = 'Import bezig...';
+        toast('UT1 import gestart. Dit kan even duren...', true);
+        const result = await post('/api/blacklist/import', { url });
+        toast(`UT1 blacklist geimporteerd: ${fmtNum(result.loaded_categories || result.categories || 0)} categorieen, ${fmtNum(result.loaded_domains || 0)} domeinen`, true);
         data = await api('/api/policy');
         navigate('/categories', true);
-      } catch (e) { toast(e.message, false); }
+      } catch (e) {
+        toast(e.message || 'Import mislukt', false);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Importeer URL';
+      }
     });
     document.getElementById('ut1-import-file').addEventListener('click', async () => {
+      const btn = document.getElementById('ut1-import-file');
       const input = document.getElementById('ut1-file');
       if (!input.files || !input.files[0]) { toast('Kies eerst een bestand', false); return; }
       const form = new FormData();
       form.append('file', input.files[0]);
       try {
-        toast('Upload/import gestart...', true);
+        btn.disabled = true;
+        btn.textContent = 'Upload bezig...';
+        toast('Upload/import gestart. Dit kan even duren...', true);
         const res = await fetch('/api/blacklist/upload', { method: 'POST', body: form });
         const payload = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(payload.error || res.statusText);
-        toast('UT1 upload geimporteerd', true);
+        toast(`UT1 upload geimporteerd: ${fmtNum(payload.loaded_categories || payload.categories || 0)} categorieen, ${fmtNum(payload.loaded_domains || 0)} domeinen`, true);
         data = await api('/api/policy');
         navigate('/categories', true);
-      } catch (e) { toast(e.message, false); }
+      } catch (e) {
+        toast(e.message || 'Upload mislukt', false);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Upload/importeer';
+      }
     });
     paint('');
   }
