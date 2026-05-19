@@ -1645,6 +1645,7 @@ class ICAPHandler(socketserver.StreamRequestHandler):
             content_type = header_get(message.res.headers, "content-type")
             request_start = message.req.start_line
             response_start = message.res.start_line
+        http_method = message.req.start_line.split(" ", 1)[0].upper() if message.req.start_line else ""
         resolver = self.server.store.identity_resolver
         assert resolver is not None
         identity = resolver.resolve(message.headers, http_headers)
@@ -1652,7 +1653,7 @@ class ICAPHandler(socketserver.StreamRequestHandler):
             direction=message.method.lower(),
             url=url,
             domain=domain,
-            method=message.method,
+            method=http_method,
             content_type=content_type,
             identity=identity,
             icap_headers=message.headers,
@@ -2855,16 +2856,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
             groups=[g.strip() for g in data.get("groups", "student").split(",") if g.strip()],
             source="dashboard-test",
         )
+        http_method = str(data.get("http_method", "POST")).upper()
         context = ScanContext(
             direction=data.get("direction", "reqmod"),
             url=data.get("url", ""),
             domain=normalize_domain(urllib.parse.urlsplit(data.get("url", "")).netloc),
-            method=data.get("direction", "REQMOD").upper(),
+            method=http_method,
             content_type=data.get("content_type", "text/plain"),
             identity=identity,
             icap_headers={},
             http_headers=headers,
-            request_start=f"GET {data.get('url', '/')} HTTP/1.1",
+            request_start=f"{http_method} {data.get('url', '/')} HTTP/1.1",
         )
         body = data.get("body", "").encode("utf-8")
         if str(data.get("skip_clamav", "on")).lower() in {"on", "true", "1", "yes"}:
@@ -4449,6 +4451,9 @@ DASHBOARD_JS = r"""
           <label class="field"><span>Groepen</span><input name="groups" value=""></label>
           <label class="field"><span>Methode/direction</span>
             <select name="direction"><option value="reqmod">REQMOD</option><option value="respmod">RESPMOD</option></select>
+          </label>
+          <label class="field"><span>HTTP methode</span>
+            <select name="http_method"><option value="POST">POST</option><option value="PUT">PUT</option><option value="PATCH">PATCH</option><option value="GET">GET</option></select>
           </label>
           <label class="field"><span>Content-Type</span><input name="content_type" value="text/plain"></label>
           <label class="check"><input name="skip_clamav" type="checkbox" checked> ClamAV overslaan</label>
