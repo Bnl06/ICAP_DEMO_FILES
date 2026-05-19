@@ -1624,11 +1624,6 @@ class ICAPHandler(socketserver.StreamRequestHandler):
         decision = store.policy_engine.evaluate(context, message.body)
         self._log_decision(message, context, decision)
         if decision.allowed:
-            # Belangrijk voor RESPMOD: bij toegelaten verkeer moet de ICAP-server
-            # de response niet opnieuw opbouwen. Dat is foutgevoelig bij chunked,
-            # gecomprimeerde of grote responses. Squid ondersteunt 204 en krijgt
-            # dan gewoon de originele server-response terug. Dit voorkomt
-            # "ICAP connection error" tijdens normaal surfen.
             if "204" in header_get(message.headers, "allow"):
                 self._send_no_adaptation()
             else:
@@ -1653,17 +1648,11 @@ class ICAPHandler(socketserver.StreamRequestHandler):
         resolver = self.server.store.identity_resolver
         assert resolver is not None
         identity = resolver.resolve(message.headers, http_headers)
-        # context.method moet de echte HTTP-methode zijn (GET/POST/PUT/...),
-        # niet de ICAP-methode (REQMOD/RESPMOD). Anders werkt DLP op POST body
-        # niet correct en kunnen policies fout evalueren.
-        http_method = ""
-        if request_start:
-            http_method = request_start.split(" ", 1)[0].upper()
         return ScanContext(
             direction=message.method.lower(),
             url=url,
             domain=domain,
-            method=http_method,
+            method=message.method,
             content_type=content_type,
             identity=identity,
             icap_headers=message.headers,
@@ -1701,6 +1690,7 @@ class ICAPHandler(socketserver.StreamRequestHandler):
             f"Date: {self._date_header()}",
             f"Server: {APP_NAME}/{APP_VERSION}",
             f"ISTag: {self.server.store.istag()}",
+            "Encapsulated: null-body=0",
             "",
             "",
         ]
@@ -1720,27 +1710,13 @@ class ICAPHandler(socketserver.StreamRequestHandler):
                 self._write_chunk(message.body)
                 self._write_chunk(b"")
         else:
-            req = message.req.raw_header
             res = message.res.raw_header
-            # Sommige Squid RESPMOD-aanvragen bevatten geen req-hdr. De oude code
-            # stuurde dan toch "req-hdr=0, res-hdr=0", wat een ongeldig/ambigu
-            # Encapsulated-header oplevert en bij Squid als ICAP connection error
-            # kan eindigen. Bouw de Encapsulated-header daarom conditioneel op.
-            if req:
-                res_offset = len(req)
-                if message.body:
-                    encapsulated = f"req-hdr=0, res-hdr={res_offset}, res-body={res_offset + len(res)}"
-                else:
-                    encapsulated = f"req-hdr=0, res-hdr={res_offset}, null-body={res_offset + len(res)}"
-                payload = req + res
+            if message.body:
+                encapsulated = f"res-hdr=0, res-body={len(res)}"
             else:
-                if message.body:
-                    encapsulated = f"res-hdr=0, res-body={len(res)}"
-                else:
-                    encapsulated = f"res-hdr=0, null-body={len(res)}"
-                payload = res
+                encapsulated = f"res-hdr=0, null-body={len(res)}"
             headers = self._icap_200_headers(encapsulated)
-            self.wfile.write(headers + payload)
+            self.wfile.write(headers + res)
             if message.body:
                 self._write_chunk(message.body)
                 self._write_chunk(b"")
